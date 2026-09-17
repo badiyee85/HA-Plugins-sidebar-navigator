@@ -249,6 +249,20 @@ function ProjectCard({ project, currentId, filterQuery }) {
             className: 'min-w-0 flex-1 truncate text-xs font-semibold uppercase tracking-wider text-(--ui-text-primary)',
             children: project.isNoProject ? 'Home' : (project.label || project.name || project.id)
           }),
+          !project.isNoProject ? jsx('button', {
+            type: 'button',
+            className: 'shrink-0 flex items-center gap-1 rounded px-1.5 py-0.5 text-[0.6875rem] font-medium text-(--ui-text-secondary) hover:text-(--ui-text-primary) hover:bg-(--chrome-action-hover) border border-(--ui-stroke-secondary) transition-colors',
+            title: `Open Cockpit for ${project.label || project.name || project.id}`,
+            onClick: (e) => {
+              e.stopPropagation()
+              const slug = project.id || project.name || project.label || ''
+              host.navigate(`/cockpit?project=${encodeURIComponent(slug)}`)
+            },
+            children: [
+              jsx(IconOr, { icon: 'Zap', glyph: '⚡' }),
+              jsx('span', { className: 'hidden sm:inline', children: 'Cockpit' })
+            ]
+          }) : null,
           jsx('span', {
             className: 'shrink-0 text-[0.6875rem] font-medium text-(--ui-text-quaternary) tabular-nums',
             children: String(totalCount)
