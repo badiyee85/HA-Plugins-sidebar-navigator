@@ -242,10 +242,12 @@ function ProjectCard({ project, currentId, filterQuery }) {
                 className: 'h-2.5 w-2.5 shrink-0 rounded-full',
                 style: { backgroundColor: project.color }
               })
-            : jsx(IconOr, { icon: 'Folder', glyph: '📁' }),
+            : project.isNoProject
+              ? jsx(IconOr, { icon: 'Home', glyph: '🏠' })
+              : jsx(IconOr, { icon: 'Folder', glyph: '📁' }),
           jsx('span', {
             className: 'min-w-0 flex-1 truncate text-xs font-semibold uppercase tracking-wider text-(--ui-text-primary)',
-            children: project.label || project.name || project.id
+            children: project.isNoProject ? 'Home' : (project.label || project.name || project.id)
           }),
           jsx('span', {
             className: 'shrink-0 text-[0.6875rem] font-medium text-(--ui-text-quaternary) tabular-nums',
@@ -301,8 +303,12 @@ function ProjectBrowser() {
   }
 
   const projects = [...(treeQuery.data?.projects ?? [])]
-    .filter((p) => !p.isNoProject)
-    .sort((a, b) => (b.lastActive ?? 0) - (a.lastActive ?? 0))
+    .sort((a, b) => {
+      // Keep Home / unassigned at the top like stock sidebar, then most active
+      if (a.isNoProject) return -1
+      if (b.isNoProject) return 1
+      return (b.lastActive ?? 0) - (a.lastActive ?? 0)
+    })
 
   if (projects.length === 0) {
     return jsx('div', { className: `${hintStyle} p-3`, children: 'No projects registered on this profile.' })
