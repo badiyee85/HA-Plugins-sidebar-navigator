@@ -42,10 +42,14 @@ hermes plugins install ha-sidebar-navigator
 ```
 
 ### Manual / Developer Mode
-Copy `desktop-plugin/plugin.js` into your Hermes Desktop plugins directory:
+Copy `desktop-plugin/` (or symlink it) into your Hermes plugins directory:
 ```bash
-mkdir -p ~/.hermes/desktop-plugins/ha-sidebar-navigator
-cp desktop-plugin/plugin.js ~/.hermes/desktop-plugins/ha-sidebar-navigator/
+mkdir -p ~/.hermes/plugins/ha-sidebar-navigator
+cp -r desktop-plugin/* ~/.hermes/plugins/ha-sidebar-navigator/
+```
+Or install directly from GitHub:
+```bash
+hermes plugins install https://github.com/badiyee85/HA-Plugins-sidebar-navigator --subdir desktop-plugin
 ```
 Press `Cmd/Ctrl + K` in Hermes Desktop and run **Reload desktop plugins**.
 
