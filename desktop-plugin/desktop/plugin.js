@@ -26,10 +26,10 @@ import {
   DialogHeader,
   DialogTitle,
   Input,
-  KEYBINDS_AREA,
   PALETTE_AREA,
   PROFILE_SWATCHES,
   ROUTES_AREA,
+  SessionStatusDot,
   SIDEBAR_NAV_AREA,
   atom,
   haptic,
@@ -39,16 +39,326 @@ import {
   useQuery,
   useValue
 } from '@hermes/plugin-sdk'
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
+export {
+  activeRouteFrom,
+  duplicateProfileNames,
+  focusedOnRoute,
+  normalizeRoute,
+  normalizeRoutes,
+  openSessionForRoute,
+  queryKey,
+  reconcileBrowseState,
+  reconcileRoute,
+  requestForRoute,
+  routeKey,
+  routeLabel,
+  rowKey,
+  storageKey
+}
+
 const ID = 'ha-sidebar-navigator'
+const LEGACY_ACTIVE_CONNECTION = '__legacy_active__'
+const LEGACY_ROUTE_MODE = 'legacy'
+const ROUTE_CACHE_TTL_MS = 5000
+
+function text(value) {
+  return String(value ?? '').trim()
+}
+
+function normalizeRoute(route) {
+  if (!route || typeof route !== 'object') return null
+
+  const connectionId = text(route.connectionId)
+  const mode = text(route.mode)
+  const profile = text(route.profile)
+  const targetProfile = text(route.targetProfile)
+
+  if (!connectionId || !profile || !targetProfile) return null
+  if (connectionId === LEGACY_ACTIVE_CONNECTION && mode === LEGACY_ROUTE_MODE) {
+    return { connectionId, mode, profile, targetProfile }
+  }
+  if (!['local', 'remote'].includes(mode)) return null
+
+  return { connectionId, mode, profile, targetProfile }
+}
+
+function legacyActiveRoute(profile) {
+  const name = text(profile)
+  return name
+    ? { connectionId: LEGACY_ACTIVE_CONNECTION, mode: LEGACY_ROUTE_MODE, profile: name, targetProfile: name }
+    : null
+}
+
+function isLegacyRoute(route) {
+  const normalized = normalizeRoute(route)
+  return Boolean(normalized && normalized.connectionId === LEGACY_ACTIVE_CONNECTION && normalized.mode === LEGACY_ROUTE_MODE)
+}
+
+function routeKey(route) {
+  const normalized = normalizeRoute(route)
+  return normalized ? `${normalized.connectionId}\u0000${normalized.profile}` : ''
+}
+
+function sameRoute(left, right) {
+  const a = normalizeRoute(left)
+  const b = normalizeRoute(right)
+  return Boolean(
+    a && b && routeKey(a) === routeKey(b) && a.mode === b.mode && a.targetProfile === b.targetProfile
+  )
+}
+
+function normalizeRoutes(routes) {
+  const unique = new Map()
+  for (const candidate of Array.isArray(routes) ? routes : []) {
+    const route = normalizeRoute(candidate)
+    if (!route) continue
+
+    const key = routeKey(route)
+    const previous = unique.get(key)
+    if (!previous) {
+      unique.set(key, route)
+    } else if (!sameRoute(previous, route)) {
+      // A remapped duplicate identity is unsafe to browse or mutate. Quarantine
+      // it rather than silently choosing whichever descriptor arrived last.
+      unique.delete(key)
+    }
+  }
+  return [...unique.values()]
+}
+
+function reconcileRoute(selected, routes) {
+  return normalizeRoutes(routes).find(candidate => sameRoute(candidate, selected)) || null
+}
+
+function activeRouteFrom(routes, connectionId, profile) {
+  const normalizedConnectionId = text(connectionId)
+  const normalizedProfile = text(profile)
+  const available = normalizeRoutes(routes)
+  const exact = available.find(route =>
+    route.connectionId === normalizedConnectionId && route.profile === normalizedProfile
+  )
+  return exact || (!normalizedConnectionId ? legacyActiveRoute(normalizedProfile) : null)
+}
+
+function reconcileBrowseState(state, routes, connectionId, profile) {
+  const available = normalizeRoutes(routes)
+  const active = activeRouteFrom(available, connectionId, profile)
+  const selected = state?.selected ? reconcileRoute(state.selected, available) : null
+  if (state?.manual) {
+    return selected
+      ? { manual: true, selected, unavailable: null }
+      : { manual: true, selected: null, unavailable: normalizeRoute(state.selected) }
+  }
+  return { manual: false, selected: active, unavailable: null }
+}
+
+function duplicateProfileNames(routes) {
+  const counts = new Map()
+  for (const route of normalizeRoutes(routes)) {
+    if (isLegacyRoute(route)) continue
+    counts.set(route.profile, (counts.get(route.profile) || 0) + 1)
+  }
+  return new Set([...counts].filter(([, count]) => count > 1).map(([profile]) => profile))
+}
+
+function routeLabel(route, duplicates = new Set()) {
+  const normalized = normalizeRoute(route)
+  if (!normalized) return 'Unavailable'
+  return duplicates.has(normalized.profile)
+    ? `${normalized.profile} · ${normalized.connectionId}`
+    : normalized.profile
+}
+
+function queryKey(resource, route, extra = []) {
+  const normalized = normalizeRoute(route)
+  return normalized
+    ? [ID, resource, normalized.connectionId, normalized.profile, normalized.mode, normalized.targetProfile, ...extra]
+    : [ID, resource, 'unavailable', ...extra]
+}
+
+function rowKey(route, sessionId) {
+  return `${routeKey(route) || 'unavailable'}\u0000${text(sessionId)}`
+}
+
+function storageKey(base, route) {
+  const normalized = normalizeRoute(route)
+  return normalized
+    ? `${base}.v2.${encodeURIComponent(normalized.connectionId)}.${encodeURIComponent(normalized.profile)}`
+    : ''
+}
+
+function focusedOnRoute(owner, route, focusedStoredId, sessionId) {
+  const normalized = normalizeRoute(route)
+  if (!normalized || text(focusedStoredId) !== text(sessionId)) return false
+  if (isLegacyRoute(normalized)) {
+    return text(owner?.profile) === normalized.profile && !text(owner?.connectionId)
+  }
+  return Boolean(
+    text(owner?.connectionId) === normalized.connectionId &&
+      text(owner?.profile) === normalized.profile
+  )
+}
+
+function ownerFrom(transportHost = host) {
+  const state = transportHost?.state || {}
+  const read = value => value && typeof value.get === 'function' ? value.get() : value
+  const connectionId = text(read(state.connectionId))
+  const profile = text(read(state.profile))
+  return profile ? { connectionId: connectionId || null, profile } : null
+}
+
+function activeOwner() {
+  return ownerFrom(host)
+}
+
+let routeCatalogHost = null
+let routeCatalog = []
+let routeCatalogExpiresAt = 0
+let routeCatalogPromise = null
+let routeCatalogGeneration = 0
+
+function clearRouteCatalogCache() {
+  routeCatalogGeneration += 1
+  routeCatalogHost = null
+  routeCatalog = []
+  routeCatalogExpiresAt = 0
+  routeCatalogPromise = null
+}
+
+async function currentRoutes(transportHost = host, fresh = false) {
+  if (typeof transportHost?.profileRoutes !== 'function') return null
+
+  const now = Date.now()
+  if (!fresh && routeCatalogHost === transportHost && routeCatalogExpiresAt > now) {
+    return routeCatalog
+  }
+  if (!fresh && routeCatalogPromise && routeCatalogHost === transportHost) {
+    return routeCatalogPromise
+  }
+
+  const generation = ++routeCatalogGeneration
+  const pending = Promise.resolve(transportHost.profileRoutes())
+    .then(raw => {
+      const routes = normalizeRoutes(raw)
+      if (generation === routeCatalogGeneration && routeCatalogHost === transportHost) {
+        routeCatalog = routes
+        routeCatalogExpiresAt = Date.now() + ROUTE_CACHE_TTL_MS
+      }
+      return routes
+    })
+    .finally(() => {
+      if (routeCatalogPromise === pending) routeCatalogPromise = null
+    })
+
+  routeCatalogHost = transportHost
+  routeCatalogPromise = pending
+  return pending
+}
+
+async function routeForRequest(route, transportHost = host, fresh = false) {
+  const normalized = normalizeRoute(route)
+  if (!normalized) throw new Error('Profile route unavailable')
+  if (isLegacyRoute(normalized)) return normalized
+
+  const routes = await currentRoutes(transportHost, fresh)
+  if (routes) {
+    const current = reconcileRoute(normalized, routes)
+    if (!current) throw new Error('The selected profile route is no longer available. Refresh Navigator.')
+    return current
+  }
+  return normalized
+}
+
+async function requestForRoute(route, method, params = {}, transportHost = host, owner = undefined, options = {}) {
+  const normalized = await routeForRequest(route, transportHost, Boolean(options.fresh))
+  const currentOwner = owner || ownerFrom(transportHost)
+
+  if (isLegacyRoute(normalized)) {
+    if (text(currentOwner?.profile) !== normalized.profile || typeof transportHost.request !== 'function') {
+      throw new Error('This Hermes Desktop can only browse the active profile. Update Desktop for profile browsing.')
+    }
+    return transportHost.request(method, params)
+  }
+
+  if (typeof transportHost.requestProfile === 'function') {
+    return transportHost.requestProfile(normalized, method, params)
+  }
+  if (
+    currentOwner?.connectionId === normalized.connectionId &&
+    text(currentOwner?.profile) === normalized.profile &&
+    typeof transportHost.request === 'function'
+  ) {
+    return transportHost.request(method, params)
+  }
+  throw new Error('This Hermes Desktop can only browse the active profile. Update Desktop for profile browsing.')
+}
+
+async function discoverRoutes() {
+  if (typeof host.profileRoutes !== 'function' || typeof host.requestProfile !== 'function') {
+    return null
+  }
+  return currentRoutes(host, true)
+}
+
+async function openSessionForRoute(route, sessionId, intent = 'in-place', sessionHost = host) {
+  const normalized = await routeForRequest(route, sessionHost, true)
+  if (typeof sessionHost.openSession !== 'function') {
+    throw new Error('Profile-aware session opening is unavailable on this Hermes Desktop build.')
+  }
+
+  if (isLegacyRoute(normalized)) {
+    return sessionHost.openSession(sessionId, {
+      profile: normalized.profile,
+      intent,
+      keepAllProfilesScope: false
+    })
+  }
+
+  // The current Desktop SDK's explicit-route branch enables its aggregate
+  // sidebar scope whenever `options.route` is present. That is incompatible
+  // with Navigator v1, which deliberately has no aggregate scope. Use the
+  // profile-only opening contract after explicitly activating the owner; the
+  // SDK then follows its normal profile switch path without taking the
+  // explicit-route branch. This is safe only when the activation door exists.
+  if (typeof sessionHost.ensureAgent !== 'function') {
+    throw new Error('Profile-aware session opening without aggregate scope is unavailable on this Hermes Desktop build.')
+  }
+
+  await sessionHost.ensureAgent(normalized.connectionId, normalized.profile)
+  return sessionHost.openSession(sessionId, {
+    profile: normalized.profile,
+    intent,
+    keepAllProfilesScope: false
+  })
+}
 const SESSIONS_LIMIT = 500
 const TREE_PREVIEW_LIMIT = 100
 const PROJECT_SESSION_LIMIT = 2000
 
 const viewAtom = atom('projects')
 const queryAtom = atom('')
+const browseStateAtom = atom({ manual: false, selected: null, unavailable: null })
+
+function readAtom(value) {
+  return value && typeof value.get === 'function' ? value.get() : value
+}
+
+function focusedOwner() {
+  if (!host.state.focusedSessionOwner) return activeOwner()
+  // A present-but-null owner is deliberately ambiguous/unresolved in the SDK;
+  // do not reinterpret it as the active route when duplicate ids may exist.
+  const owner = readAtom(host.state.focusedSessionOwner)
+  return owner && text(owner.profile) ? owner : null
+}
+
+function invalidateRoute(route) {
+  queryClient.invalidateQueries({ queryKey: queryKey('sessions', route) })
+  queryClient.invalidateQueries({ queryKey: queryKey('projects-tree', route) })
+  queryClient.invalidateQueries({ queryKey: queryKey('project-sessions', route) })
+}
 
 function setView(view) {
   if (view === 'sessions' || view === 'projects') {
@@ -76,10 +386,6 @@ if (typeof window !== 'undefined') {
   window.addEventListener('popstate', sync)
 }
 
-function sessionRoute(id) {
-  return '/' + encodeURIComponent(id)
-}
-
 function timeAgo(seconds) {
   if (!seconds) return ''
   const mins = Math.max(0, Math.floor((Date.now() / 1000 - seconds) / 60))
@@ -103,7 +409,7 @@ function formatTokens(tokens) {
 
 const hintStyle = 'text-[0.75rem] leading-snug text-(--ui-text-quaternary)'
 const rowBtn =
-  'group flex w-full items-center gap-2 rounded-md px-2.5 py-1.5 text-left text-[0.8125rem] ' +
+  'group relative flex w-full items-center gap-2 rounded-md px-2.5 py-1.5 text-left text-[0.8125rem] ' +
   'text-(--ui-text-primary) transition-colors hover:bg-(--chrome-action-hover)'
 const rowBtnActive =
   rowBtn + ' bg-(--chrome-action-hover) font-medium border-l-2 border-(--ui-accent)'
@@ -112,9 +418,9 @@ const chipBtn =
   'text-(--ui-text-secondary) transition-colors hover:bg-(--chrome-action-hover) ' +
   'hover:text-foreground disabled:cursor-not-allowed disabled:opacity-40'
 const segActive =
-  'rounded-md px-2.5 py-1 text-[0.75rem] font-medium bg-(--ui-accent) text-(--ui-bg-primary)'
+  'shrink-0 rounded-md px-2.5 py-1 text-[0.75rem] font-medium bg-(--ui-accent) text-(--ui-bg-primary)'
 const segIdle =
-  'rounded-md px-2.5 py-1 text-[0.75rem] font-medium text-(--ui-text-secondary) hover:bg-(--chrome-action-hover)'
+  'shrink-0 rounded-md px-2.5 py-1 text-[0.75rem] font-medium text-(--ui-text-secondary) hover:bg-(--chrome-action-hover)'
 
 function IconOr({ icon, glyph }) {
   const Cmp = icons?.[icon]
@@ -123,21 +429,15 @@ function IconOr({ icon, glyph }) {
 
 // ── Session Context Menu Actions & Storage Helpers ──────────────────────────
 
-function isSessionPinned(sessionId, session) {
+function isSessionPinned(sessionId, session, route) {
   if (session?.pinned === true) return true
-  try {
-    const raw = typeof window !== 'undefined' ? window.localStorage?.getItem('hermes.desktop.pinnedSessions') : null
-    if (raw) {
-      const list = JSON.parse(raw)
-      if (Array.isArray(list) && list.includes(sessionId)) return true
-    }
-  } catch {}
-  return false
+  return readIdList(storageKey('hermes.desktop.pinnedSessions', route)).includes(sessionId)
 }
 
-function getSessionColorOverride(sessionId) {
+function getSessionColorOverride(sessionId, route) {
   try {
-    const raw = typeof window !== 'undefined' ? window.localStorage?.getItem('hermes.desktop.sessionColors') : null
+    const key = storageKey('hermes.desktop.sessionColors', route)
+    const raw = typeof window !== 'undefined' ? window.localStorage?.getItem(key) : null
     if (raw) {
       const map = JSON.parse(raw)
       if (map && map[sessionId]) return map[sessionId]
@@ -146,18 +446,20 @@ function getSessionColorOverride(sessionId) {
   return null
 }
 
-function setSessionColorOverride(sessionId, color) {
+function setSessionColorOverride(sessionId, color, route) {
   try {
-    const raw = typeof window !== 'undefined' ? window.localStorage?.getItem('hermes.desktop.sessionColors') : null
+    const key = storageKey('hermes.desktop.sessionColors', route)
+    if (!key) return
+    const raw = typeof window !== 'undefined' ? window.localStorage?.getItem(key) : null
     const map = raw ? JSON.parse(raw) || {} : {}
     if (color) {
       map[sessionId] = color
     } else {
       delete map[sessionId]
     }
-    window.localStorage?.setItem('hermes.desktop.sessionColors', JSON.stringify(map))
+    window.localStorage?.setItem(key, JSON.stringify(map))
     window.dispatchEvent(new StorageEvent('storage', {
-      key: 'hermes.desktop.sessionColors',
+      key,
       newValue: JSON.stringify(map)
     }))
   } catch (err) {
@@ -165,52 +467,46 @@ function setSessionColorOverride(sessionId, color) {
   }
 }
 
-async function toggleSessionPin(sessionId, currentlyPinned, profile) {
+// Hermes' public gateway RPC surface has no route-aware pin/read verbs. Keep
+// these presentation-only controls route-qualified rather than falling back to
+// a private REST bridge or an active-gateway request, which could mutate the
+// wrong source when duplicate session ids exist.
+function readIdList(key) {
+  if (!key || typeof window === 'undefined') return []
   try {
-    const raw = typeof window !== 'undefined' ? window.localStorage?.getItem('hermes.desktop.pinnedSessions') : null
-    let list = []
-    if (raw) {
-      try { list = JSON.parse(raw) || [] } catch {}
-    }
-    if (currentlyPinned) {
-      list = list.filter(id => id !== sessionId)
-    } else {
-      if (!list.includes(sessionId)) list.unshift(sessionId)
-    }
-    window.localStorage?.setItem('hermes.desktop.pinnedSessions', JSON.stringify(list))
-    window.dispatchEvent(new StorageEvent('storage', {
-      key: 'hermes.desktop.pinnedSessions',
-      newValue: JSON.stringify(list)
-    }))
-  } catch (err) {
-    console.warn('Failed to update pinned sessions in storage', err)
-  }
-
-  if (typeof window !== 'undefined' && window.hermesDesktop?.api) {
-    try {
-      await window.hermesDesktop.api({
-        path: `/api/sessions/${encodeURIComponent(sessionId)}`,
-        method: 'PATCH',
-        body: { pinned: !currentlyPinned, ...(profile ? { profile } : {}) }
-      })
-    } catch (err) {
-      console.warn('Backend pin PATCH failed', err)
-    }
+    const parsed = JSON.parse(window.localStorage?.getItem(key) || '[]')
+    return Array.isArray(parsed) ? parsed.filter(id => typeof id === 'string') : []
+  } catch {
+    return []
   }
 }
 
-async function toggleSessionUnread(sessionId, currentlyUnread, profile) {
-  if (typeof window !== 'undefined' && window.hermesDesktop?.api) {
-    try {
-      await window.hermesDesktop.api({
-        path: `/api/sessions/${encodeURIComponent(sessionId)}`,
-        method: 'PATCH',
-        body: { unread: !currentlyUnread, ...(profile ? { profile } : {}) }
-      })
-    } catch (err) {
-      console.warn('Backend unread PATCH failed', err)
-    }
-  }
+function writeIdList(key, list) {
+  if (!key || typeof window === 'undefined') return false
+  const value = JSON.stringify(list)
+  window.localStorage?.setItem(key, value)
+  window.dispatchEvent(new StorageEvent('storage', { key, newValue: value }))
+  return true
+}
+
+async function toggleSessionPin(sessionId, currentlyPinned, route) {
+  const key = storageKey('hermes.desktop.pinnedSessions', route)
+  const list = readIdList(key)
+  const next = currentlyPinned
+    ? list.filter(id => id !== sessionId)
+    : [sessionId, ...list.filter(id => id !== sessionId)]
+  if (!writeIdList(key, next)) throw new Error('Pinned session storage is unavailable.')
+  return !currentlyPinned
+}
+
+async function toggleSessionUnread(sessionId, currentlyUnread, route) {
+  const key = storageKey('hermes.desktop.unreadSessions', route)
+  const list = readIdList(key)
+  const next = currentlyUnread
+    ? list.filter(id => id !== sessionId)
+    : [sessionId, ...list.filter(id => id !== sessionId)]
+  if (!writeIdList(key, next)) throw new Error('Unread session storage is unavailable.')
+  return !currentlyUnread
 }
 
 function copySessionId(sessionId) {
@@ -224,52 +520,38 @@ function copySessionId(sessionId) {
   }
 }
 
-async function branchSession(session, profile) {
+async function mutateForRoute(route, method, params = {}) {
+  clearRouteCatalogCache()
+  return requestForRoute(route, method, params, host, undefined, { fresh: true })
+}
+
+async function openSessionSafely(route, sessionId, intent = 'in-place') {
+  try {
+    await openSessionForRoute(route, sessionId, intent)
+  } catch (err) {
+    host.notifyError?.(err, intent === 'window' ? 'Failed to open session in a new window' : 'Failed to open session')
+  }
+}
+
+async function branchSession(session, route) {
   host.notify({ kind: 'info', message: 'Branching session…' })
   try {
-    if (typeof window !== 'undefined' && window.hermesDesktop?.api) {
-      const res = await window.hermesDesktop.api({
-        path: `/api/sessions/${encodeURIComponent(session.id)}/fork`,
-        method: 'POST',
-        body: { ...(profile ? { profile } : {}) }
-      })
-      if (res?.session?.id) {
-        queryClient.invalidateQueries({ queryKey: [ID] })
-        host.navigate(sessionRoute(res.session.id))
-        host.notify({ kind: 'success', message: 'Branched to new session' })
-        return
-      }
-    }
-    const res = await host.request('session.branch', {
-      session_id: session.id,
-      profile
-    })
-    const newId = res?.session_key || res?.session_id
-    if (newId) {
-      queryClient.invalidateQueries({ queryKey: [ID] })
-      host.navigate(sessionRoute(newId))
-      host.notify({ kind: 'success', message: 'Branched to new session' })
-    }
+    const result = await mutateForRoute(route, 'session.branch', { session_id: session.id })
+    const newId = result?.stored_session_id || result?.session_key || result?.session_id
+    if (!newId) throw new Error('Branch did not return a session id')
+    invalidateRoute(route)
+    await openSessionForRoute(route, newId)
+    host.notify({ kind: 'success', message: 'Branched to new session' })
   } catch (err) {
     host.notifyError?.(err, 'Failed to branch session')
   }
 }
 
-async function exportSession(session, profile) {
+async function exportSession(session, route) {
   host.notify({ kind: 'info', message: 'Preparing session export…' })
   try {
-    let messages = []
-    if (typeof window !== 'undefined' && window.hermesDesktop?.api) {
-      try {
-        const res = await window.hermesDesktop.api({
-          path: `/api/sessions/${encodeURIComponent(session.id)}/messages?limit=5000&includeCompacted=true`,
-          method: 'GET'
-        })
-        messages = res?.messages || []
-      } catch (e) {
-        console.warn('Failed to get full messages for export', e)
-      }
-    }
+    const result = await requestForRoute(route, 'session.history', { session_id: session.id })
+    const messages = result?.messages || []
     const payload = {
       exported_at: new Date().toISOString(),
       session_id: session.id,
@@ -296,82 +578,69 @@ async function exportSession(session, profile) {
   }
 }
 
-async function moveSessionToProject(sessionId, project) {
+async function moveSessionToProject(sessionId, project, route) {
   const targetCwd = (project?.path || project?.repos?.find(r => r.path)?.path || '').trim()
   if (!targetCwd) {
     host.notify({ kind: 'error', message: 'Target project has no directory path' })
     return
   }
   try {
-    await host.request('session.workspace.move', {
-      session_key: sessionId,
-      cwd: targetCwd
-    })
-    queryClient.invalidateQueries({ queryKey: [ID] })
+    await mutateForRoute(route, 'session.workspace.move', { session_key: sessionId, cwd: targetCwd })
+    invalidateRoute(route)
     host.notify({ kind: 'success', message: `Moved to ${project.label || project.name || project.id}` })
   } catch (err) {
     host.notifyError?.(err, 'Failed to move session to project')
   }
 }
 
-async function archiveSession(sessionId, profile) {
+async function archiveSession(sessionId, route) {
   try {
-    if (typeof window !== 'undefined' && window.hermesDesktop?.api) {
-      await window.hermesDesktop.api({
-        path: `/api/sessions/${encodeURIComponent(sessionId)}`,
-        method: 'PATCH',
-        body: { archived: true, ...(profile ? { profile } : {}) }
-      })
-    }
-    queryClient.invalidateQueries({ queryKey: [ID] })
+    await mutateForRoute(route, 'session.set_hidden', { session_id: sessionId, hidden: true })
+    invalidateRoute(route)
     host.notify({ kind: 'success', message: 'Session archived' })
   } catch (err) {
     host.notifyError?.(err, 'Failed to archive session')
   }
 }
 
-async function deleteSession(sessionId, profile) {
+async function deleteSession(sessionId, route) {
   try {
-    if (typeof window !== 'undefined' && window.hermesDesktop?.api) {
-      await window.hermesDesktop.api({
-        path: `/api/sessions/${encodeURIComponent(sessionId)}`,
-        method: 'DELETE',
-        body: { ...(profile ? { profile } : {}) }
-      })
-    } else {
-      await host.request('session.delete', {
-        session_id: sessionId,
-        profile
-      })
-    }
-    queryClient.invalidateQueries({ queryKey: [ID] })
+    await mutateForRoute(route, 'session.delete', { session_id: sessionId })
+    invalidateRoute(route)
     host.notify({ kind: 'success', message: 'Session deleted' })
-    if (focusAtom.get() === sessionId) {
-      host.navigate('/')
-    }
+    const owner = focusedOwner()
+    if (focusedOnRoute(owner, route, focusAtom.get(), sessionId)) host.navigate('/')
   } catch (err) {
     host.notifyError?.(err, 'Failed to delete session')
   }
 }
 
-async function openSessionInNewWindow(sessionId, profile) {
-  if (typeof window !== 'undefined' && window.hermesDesktop?.openSessionWindow) {
-    try {
-      await window.hermesDesktop.openSessionWindow(sessionId, { profile })
-      return
-    } catch (e) {
-      console.warn('openSessionWindow failed', e)
-    }
-  }
-  host.openSession(sessionId, { intent: 'window' })
+async function openSessionInNewWindow(sessionId, route) {
+  await openSessionSafely(route, sessionId, 'window')
 }
 
 // ── Session Row with Context Menu ───────────────────────────────────────────
 
-function SessionRow({ session, focused, project, allProjects }) {
-  const isCurrent = focused || session.id === focusAtom.get()
-  const profile = useValue(host.state.profile)
-  const rowProfile = session.profile || profile
+function SessionStatusIndicator({ session, route, colorOverride }) {
+  const isLocal = isLocalRoute(route)
+  if (isLocal && typeof SessionStatusDot === 'function') {
+    return jsx(SessionStatusDot, {
+      storedSessionId: session.id,
+      session,
+      className: 'shrink-0'
+    })
+  }
+
+  // Cross-profile or fallback rendering:
+  return jsx('span', {
+    className: 'inline-block h-1.5 w-1.5 shrink-0 rounded-full bg-(--ui-text-quaternary)',
+    style: colorOverride ? { backgroundColor: colorOverride, opacity: 0.9 } : undefined
+  })
+}
+
+function SessionRow({ session, focused, project, allProjects, route }) {
+  const owner = focusedOwner()
+  const isCurrent = focused && focusedOnRoute(owner, route, focusAtom.get(), session.id)
   const tokenStr = formatTokens((session.input_tokens || 0) + (session.output_tokens || 0))
   const ageStr = timeAgo(session.started_at)
   const meta = [tokenStr !== '0' ? tokenStr : null, ageStr].filter(Boolean).join(' · ')
@@ -381,9 +650,20 @@ function SessionRow({ session, focused, project, allProjects }) {
   const [renaming, setRenaming] = useState(false)
   const [deleteOpen, setDeleteOpen] = useState(false)
 
-  const [pinned, setPinned] = useState(() => isSessionPinned(session.id, session))
-  const [unread, setUnread] = useState(() => Boolean(session.unread))
-  const [colorOverride, setColorOverride] = useState(() => getSessionColorOverride(session.id))
+  const [pinned, setPinned] = useState(() => isSessionPinned(session.id, session, route))
+  const [unread, setUnread] = useState(() => {
+    if (session.unread) return true
+    try {
+      const raw = typeof window !== 'undefined'
+        ? window.localStorage?.getItem(storageKey('hermes.desktop.unreadSessions', route))
+        : null
+      const list = raw ? JSON.parse(raw) : []
+      return Array.isArray(list) && list.includes(session.id)
+    } catch {
+      return false
+    }
+  })
+  const [colorOverride, setColorOverride] = useState(() => getSessionColorOverride(session.id, route))
 
   // Find target projects for "Move to project"
   const currentProjectId = project?.id
@@ -405,16 +685,8 @@ function SessionRow({ session, focused, project, allProjects }) {
     }
     setRenaming(true)
     try {
-      if (typeof window !== 'undefined' && window.hermesDesktop?.api) {
-        await window.hermesDesktop.api({
-          path: `/api/sessions/${encodeURIComponent(session.id)}`,
-          method: 'PATCH',
-          body: { title: next, ...(rowProfile ? { profile: rowProfile } : {}) }
-        })
-      } else {
-        await host.request('session.title', { session_id: session.id, title: next })
-      }
-      queryClient.invalidateQueries({ queryKey: [ID] })
+      await mutateForRoute(route, 'session.title', { session_id: session.id, title: next })
+      invalidateRoute(route)
       host.notify({ kind: 'success', message: 'Renamed session' })
       setRenameOpen(false)
     } catch (err) {
@@ -424,16 +696,18 @@ function SessionRow({ session, focused, project, allProjects }) {
     }
   }
 
+  const isLocal = isLocalRoute(route)
+  const busyMap = useValue(host?.state?.busyBySession) || {}
+  const isBusy = Boolean(isLocal && session.id && (busyMap[session.id] || (isCurrent && host?.state?.busy && useValue(host?.state?.busy))))
+
   const rowButton = jsxs('button', {
     type: 'button',
     className: isCurrent ? rowBtnActive : rowBtn,
-    onClick: () => host.navigate(sessionRoute(session.id)),
+    onClick: () => void openSessionSafely(route, session.id),
     title: session.title || session.preview || session.id,
     children: [
-      jsx('span', {
-        className: 'inline-block h-2 w-2 shrink-0 rounded-full bg-(--ui-accent) opacity-80 group-hover:opacity-100',
-        style: colorOverride ? { backgroundColor: colorOverride, opacity: 1 } : undefined
-      }),
+      isBusy ? jsx('span', { 'aria-hidden': 'true', className: 'arc-border arc-row' }) : null,
+      jsx(SessionStatusIndicator, { session, route, colorOverride }),
       jsx('span', {
         className: 'min-w-0 flex-1 truncate text-left',
         children: session.title || session.preview || session.id
@@ -461,7 +735,7 @@ function SessionRow({ session, focused, project, allProjects }) {
               jsxs(ContextMenuItem, {
                 onSelect: () => {
                   haptic?.('selection')
-                  void openSessionInNewWindow(session.id, rowProfile)
+                  void openSessionInNewWindow(session.id, route)
                 },
                 children: [
                   jsx(Codicon, { name: 'link-external', size: '0.875rem' }),
@@ -482,15 +756,18 @@ function SessionRow({ session, focused, project, allProjects }) {
               }),
               // 3. Pin / Unpin
               jsxs(ContextMenuItem, {
-                onSelect: () => {
+                onSelect: async () => {
                   haptic?.('selection')
-                  const next = !pinned
-                  setPinned(next)
-                  void toggleSessionPin(session.id, pinned, rowProfile)
-                  host.notify({
-                    kind: 'info',
-                    message: next ? 'Pinned session to top' : 'Unpinned session'
-                  })
+                  try {
+                    const next = await toggleSessionPin(session.id, pinned, route)
+                    setPinned(next)
+                    host.notify({
+                      kind: 'info',
+                      message: next ? 'Pinned in Navigator' : 'Unpinned in Navigator'
+                    })
+                  } catch (err) {
+                    host.notifyError?.(err, 'Failed to update Navigator pin')
+                  }
                 },
                 children: [
                   jsx(Codicon, { name: 'pin', size: '0.875rem' }),
@@ -499,15 +776,18 @@ function SessionRow({ session, focused, project, allProjects }) {
               }),
               // 4. Mark as unread / Mark as read
               jsxs(ContextMenuItem, {
-                onSelect: () => {
+                onSelect: async () => {
                   haptic?.('selection')
-                  const next = !unread
-                  setUnread(next)
-                  void toggleSessionUnread(session.id, unread, rowProfile)
-                  host.notify({
-                    kind: 'info',
-                    message: next ? 'Marked as unread' : 'Marked as read'
-                  })
+                  try {
+                    const next = await toggleSessionUnread(session.id, unread, route)
+                    setUnread(next)
+                    host.notify({
+                      kind: 'info',
+                      message: next ? 'Marked unread in Navigator' : 'Marked read in Navigator'
+                    })
+                  } catch (err) {
+                    host.notifyError?.(err, 'Failed to update Navigator unread state')
+                  }
                 },
                 children: [
                   jsx(Codicon, { name: unread ? 'mail-read' : 'mail', size: '0.875rem' }),
@@ -531,7 +811,7 @@ function SessionRow({ session, focused, project, allProjects }) {
                       onChange: (color) => {
                         haptic?.('selection')
                         setColorOverride(color)
-                        setSessionColorOverride(session.id, color)
+                        setSessionColorOverride(session.id, color, route)
                       },
                       swatches: PROFILE_SWATCHES,
                       value: colorOverride
@@ -554,7 +834,7 @@ function SessionRow({ session, focused, project, allProjects }) {
               jsx(ContextMenuSeparator, {}),
               // 7. Branch
               jsxs(ContextMenuItem, {
-                onSelect: () => void branchSession(session, rowProfile),
+                onSelect: () => void branchSession(session, route),
                 children: [
                   jsx(Codicon, { name: 'repo-forked', size: '0.875rem' }),
                   jsx('span', { children: 'Branch' })
@@ -562,7 +842,7 @@ function SessionRow({ session, focused, project, allProjects }) {
               }),
               // 8. Export
               jsxs(ContextMenuItem, {
-                onSelect: () => void exportSession(session, rowProfile),
+                onSelect: () => void exportSession(session, route),
                 children: [
                   jsx(Codicon, { name: 'cloud-download', size: '0.875rem' }),
                   jsx('span', { children: 'Export' })
@@ -583,7 +863,7 @@ function SessionRow({ session, focused, project, allProjects }) {
                       : targetProjects.map(proj =>
                           jsx(ContextMenuItem, {
                             key: proj.id,
-                            onSelect: () => void moveSessionToProject(session.id, proj),
+                            onSelect: () => void moveSessionToProject(session.id, proj, route),
                             children: proj.label || proj.name || proj.id
                           })
                         )
@@ -594,7 +874,7 @@ function SessionRow({ session, focused, project, allProjects }) {
               jsx(ContextMenuSeparator, {}),
               // 10. Archive
               jsxs(ContextMenuItem, {
-                onSelect: () => void archiveSession(session.id, rowProfile),
+                onSelect: () => void archiveSession(session.id, route),
                 children: [
                   jsx(Codicon, { name: 'archive', size: '0.875rem' }),
                   jsx('span', { children: 'Archive' })
@@ -670,7 +950,7 @@ function SessionRow({ session, focused, project, allProjects }) {
         description: `Are you sure you want to delete "${session.title || session.preview || session.id}"? This action cannot be undone.`,
         confirmLabel: 'Delete',
         destructive: true,
-        onConfirm: () => deleteSession(session.id, rowProfile)
+        onConfirm: () => deleteSession(session.id, route)
       })
     ]
   })
@@ -678,21 +958,22 @@ function SessionRow({ session, focused, project, allProjects }) {
 
 // ── Sessions Flattened View ──────────────────────────────────────────────────
 
-function SessionBrowser() {
-  const profile = useValue(host.state.profile)
+function SessionBrowser({ route }) {
   const q = useValue(queryAtom).trim().toLowerCase()
   const currentId = useValue(focusAtom)
 
   const listQuery = useQuery({
-    queryKey: [ID, 'sessions', profile],
-    queryFn: () => host.request('session.list', { limit: SESSIONS_LIMIT }),
+    queryKey: queryKey('sessions', route),
+    queryFn: () => requestForRoute(route, 'session.list', { limit: SESSIONS_LIMIT }),
+    enabled: Boolean(route),
     refetchInterval: 15000,
     staleTime: 5000
   })
 
   const treeQuery = useQuery({
-    queryKey: [ID, 'projects-tree', profile],
-    queryFn: () => host.request('projects.tree', { preview_limit: TREE_PREVIEW_LIMIT }),
+    queryKey: queryKey('projects-tree', route),
+    queryFn: () => requestForRoute(route, 'projects.tree', { preview_limit: TREE_PREVIEW_LIMIT }),
+    enabled: Boolean(route),
     staleTime: 8000
   })
 
@@ -722,7 +1003,7 @@ function SessionBrowser() {
       jsx('div', {
         className: 'min-h-0 flex-1 overflow-y-auto px-1.5 pb-3',
         children: filtered.map((s) =>
-          jsx(SessionRow, { session: s, focused: s.id === currentId, allProjects }, s.id)
+          jsx(SessionRow, { session: s, focused: s.id === currentId, allProjects, route }, rowKey(route, s.id))
         )
       })
     ]
@@ -744,7 +1025,7 @@ function extractSessionsFromProjectTree(project) {
   return rows
 }
 
-function ProjectCard({ project, allProjects, currentId, filterQuery }) {
+function ProjectCard({ project, allProjects, currentId, filterQuery, route }) {
   const [expanded, setExpanded] = useState(true)
   const [loadAll, setLoadAll] = useState(false)
 
@@ -753,12 +1034,12 @@ function ProjectCard({ project, allProjects, currentId, filterQuery }) {
 
   // Full session fetch when requested or if totalCount > preview.length
   const fullQuery = useQuery({
-    queryKey: [ID, 'project-sessions', project.id],
-    queryFn: () => host.request('projects.project_sessions', {
+    queryKey: queryKey('project-sessions', route, [project.id]),
+    queryFn: () => requestForRoute(route, 'projects.project_sessions', {
       project_id: project.id,
       session_limit: PROJECT_SESSION_LIMIT
     }),
-    enabled: loadAll,
+    enabled: Boolean(route) && loadAll,
     staleTime: 10000
   })
 
@@ -775,6 +1056,12 @@ function ProjectCard({ project, allProjects, currentId, filterQuery }) {
   }
 
   const hasTruncated = !loadAll && totalCount > preview.length
+
+  const isLocal = isLocalRoute(route)
+  const busyMap = useValue(host?.state?.busyBySession) || {}
+  const activeCount = isLocal
+    ? (sessions || []).filter(s => s?.id && busyMap[s.id]).length
+    : 0
 
   return jsxs('div', {
     className: 'mb-3 rounded-lg border border-(--ui-stroke-secondary) bg-(--ui-bg-subtle)/30 p-1.5',
@@ -804,6 +1091,14 @@ function ProjectCard({ project, allProjects, currentId, filterQuery }) {
             className: 'min-w-0 flex-1 truncate text-xs font-semibold uppercase tracking-wider text-(--ui-text-primary)',
             children: project.isNoProject ? 'Home' : (project.label || project.name || project.id)
           }),
+          activeCount > 0 ? jsx('span', {
+            className: 'shrink-0 flex items-center gap-1 rounded-full bg-(--ui-accent)/15 px-1.5 py-0.2 text-[0.625rem] font-medium text-(--ui-accent)',
+            title: `${activeCount} active session${activeCount === 1 ? '' : 's'}`,
+            children: [
+              jsx('span', { className: 'inline-block h-1.5 w-1.5 rounded-full bg-(--ui-accent)' }),
+              jsx('span', { children: `${activeCount} active` })
+            ]
+          }) : null,
           !project.isNoProject ? jsx('button', {
             type: 'button',
             className: 'shrink-0 flex items-center gap-1 rounded px-1.5 py-0.5 text-[0.6875rem] font-medium text-(--ui-text-secondary) hover:text-(--ui-text-primary) hover:bg-(--chrome-action-hover) border border-(--ui-stroke-secondary) transition-colors',
@@ -836,7 +1131,7 @@ function ProjectCard({ project, allProjects, currentId, filterQuery }) {
               : sessions.length === 0
                 ? jsx('div', { className: `${hintStyle} px-2 py-1`, children: 'No matching sessions' })
                 : sessions.map((s) =>
-                    jsx(SessionRow, { session: s, focused: s.id === currentId, project, allProjects }, `${project.id}/${s.id}`)
+                    jsx(SessionRow, { session: s, focused: s.id === currentId, project, allProjects, route }, `${project.id}/${rowKey(route, s.id)}`)
                   )
           }),
           hasTruncated ? jsx('button', {
@@ -851,14 +1146,14 @@ function ProjectCard({ project, allProjects, currentId, filterQuery }) {
   })
 }
 
-function ProjectBrowser() {
-  const profile = useValue(host.state.profile)
+function ProjectBrowser({ route }) {
   const q = useValue(queryAtom).trim().toLowerCase()
   const currentId = useValue(focusAtom)
 
   const treeQuery = useQuery({
-    queryKey: [ID, 'projects-tree', profile],
-    queryFn: () => host.request('projects.tree', { preview_limit: TREE_PREVIEW_LIMIT }),
+    queryKey: queryKey('projects-tree', route),
+    queryFn: () => requestForRoute(route, 'projects.tree', { preview_limit: TREE_PREVIEW_LIMIT }),
+    enabled: Boolean(route),
     refetchInterval: 20000,
     staleTime: 8000
   })
@@ -886,22 +1181,134 @@ function ProjectBrowser() {
   return jsx('div', {
     className: 'min-h-0 flex-1 overflow-y-auto px-2 py-1.5',
     children: projects.map((p) =>
-      jsx(ProjectCard, { project: p, allProjects: projects, currentId, filterQuery: q }, p.id)
+      jsx(ProjectCard, { project: p, allProjects: projects, currentId, filterQuery: q, route }, `${routeKey(route)}/${p.id}`)
     )
   })
 }
 
 // ── Navigator Shell (Main Pane) ──────────────────────────────────────────────
 
+function useRouteCatalog(connectionId, profile) {
+  const [routes, setRoutes] = useState([])
+  const [status, setStatus] = useState('loading')
+  const [error, setError] = useState('')
+  const generation = useRef(0)
+
+  const refresh = async () => {
+    const requestGeneration = ++generation.current
+    setStatus('loading')
+    try {
+      const next = await discoverRoutes()
+      if (requestGeneration !== generation.current) return []
+      if (next === null) {
+        const fallback = legacyActiveRoute(profile)
+        const legacy = fallback ? [fallback] : []
+        setRoutes(legacy)
+        setStatus(legacy.length ? 'legacy' : 'error')
+        setError(legacy.length ? 'Profile browsing needs a newer Hermes Desktop; showing the active profile only.' : 'No active profile is available.')
+        browseStateAtom.set(reconcileBrowseState({ manual: false, selected: null }, legacy, connectionId, profile))
+        return legacy
+      }
+      setRoutes(next)
+      setStatus(next.length ? 'ready' : 'error')
+      setError(next.length ? '' : 'No profile routes are currently available.')
+      browseStateAtom.set(reconcileBrowseState(browseStateAtom.get(), next, connectionId, profile))
+      return next
+    } catch (reason) {
+      if (requestGeneration !== generation.current) return []
+      setRoutes([])
+      setStatus('error')
+      setError(reason?.message || 'Profile routes are unavailable.')
+      browseStateAtom.set(reconcileBrowseState(browseStateAtom.get(), [], connectionId, profile))
+      return []
+    }
+  }
+
+  useEffect(() => {
+    generation.current += 1
+    void refresh()
+  }, [connectionId, profile])
+
+  return { routes, status, error, refresh }
+}
+
+function ProfileSelector({ catalog, activeRoute }) {
+  const browse = useValue(browseStateAtom)
+  const duplicates = duplicateProfileNames(catalog.routes)
+  const selected = browse.selected || (!browse.manual ? activeRoute : null)
+
+  return jsxs('div', {
+    className: 'border-b border-(--ui-stroke-secondary) px-2.5 py-2',
+    children: [
+      jsxs('div', {
+        className: 'mb-1 flex items-center justify-between gap-2',
+        children: [
+          jsx('span', { className: hintStyle, children: 'Browse profile' }),
+          jsx('button', {
+            type: 'button',
+            className: chipBtn,
+            disabled: catalog.status === 'loading',
+            title: 'Refresh profile routes and this profile’s data',
+            onClick: async () => {
+              await catalog.refresh()
+              if (browseStateAtom.get().selected) invalidateRoute(browseStateAtom.get().selected)
+            },
+            children: jsx(IconOr, { icon: 'RefreshCw', glyph: '↻' })
+          })
+        ]
+      }),
+      catalog.routes.length
+        ? jsx('div', {
+            className: 'min-w-0 overflow-x-auto overflow-y-hidden',
+            children: jsx('div', {
+              className: 'flex w-max items-center gap-1',
+              role: 'group',
+              'aria-label': 'Navigator profile scope',
+              children: catalog.routes.map(route => {
+                const key = routeKey(route)
+                const chosen = selected && key === routeKey(selected)
+                const active = activeRoute && key === routeKey(activeRoute)
+                const label = routeLabel(route, duplicates)
+                return jsx('button', {
+                  type: 'button',
+                  key,
+                  className: chosen ? segActive : segIdle,
+                  'aria-pressed': Boolean(chosen),
+                  'aria-label': `${label}${active ? ', active Desktop profile' : ''}`,
+                  title: active ? `${label} — active Desktop profile` : `Browse ${label}`,
+                  onClick: () => browseStateAtom.set({ manual: true, selected: route, unavailable: null }),
+                  children: `${label}${active ? ' · active' : ''}`
+                })
+              })
+            })
+          })
+        : jsx('div', { className: hintStyle, children: catalog.error || 'Loading profile routes…' }),
+      browse.unavailable
+        ? jsx('div', {
+            className: `${hintStyle} mt-1`,
+            children: `The selected profile (${routeLabel(browse.unavailable, duplicates)}) is no longer available. Choose another profile.`
+          })
+        : catalog.status === 'legacy'
+          ? jsx('div', { className: `${hintStyle} mt-1`, children: catalog.error })
+          : null
+    ]
+  })
+}
+
 function NavigatorShell() {
   const view = useValue(viewAtom)
   const q = useValue(queryAtom)
   const profile = useValue(host.state.profile)
+  const connectionId = host.state.connectionId ? useValue(host.state.connectionId) : ''
+  const browse = useValue(browseStateAtom)
+  const catalog = useRouteCatalog(connectionId, profile)
+  const activeRoute = activeRouteFrom(catalog.routes, connectionId, profile)
+  const selectedRoute = browse.selected || (!browse.manual ? activeRoute : null)
 
   return jsxs('div', {
     className: 'flex h-full min-h-0 flex-col bg-(--ui-bg-primary) text-(--ui-text-primary)',
     children: [
-      // Top Controls: View switch & Search
+      jsx(ProfileSelector, { catalog, activeRoute }),
       jsxs('div', {
         className: 'flex flex-col gap-2 border-b border-(--ui-stroke-secondary) p-2.5',
         children: [
@@ -928,8 +1335,9 @@ function NavigatorShell() {
               jsx('button', {
                 type: 'button',
                 className: chipBtn,
-                title: `Refresh (${profile || 'default'})`,
-                onClick: () => void queryClient.invalidateQueries({ queryKey: [ID] }),
+                disabled: !selectedRoute,
+                title: selectedRoute ? `Refresh ${routeLabel(selectedRoute)}` : 'Choose a profile first',
+                onClick: () => selectedRoute && invalidateRoute(selectedRoute),
                 children: jsx(IconOr, { icon: 'RefreshCw', glyph: '↻' })
               })
             ]
@@ -943,11 +1351,13 @@ function NavigatorShell() {
           })
         ]
       }),
-
-      // Content View
       jsx('div', {
-        className: 'min-h-0 flex-1 overflow-hidden flex flex-col',
-        children: view === 'projects' ? jsx(ProjectBrowser, {}) : jsx(SessionBrowser, {})
+        className: 'min-h-0 flex flex-1 flex-col overflow-hidden',
+        children: selectedRoute
+          ? (view === 'projects'
+              ? jsx(ProjectBrowser, { route: selectedRoute }, routeKey(selectedRoute))
+              : jsx(SessionBrowser, { route: selectedRoute }, routeKey(selectedRoute)))
+          : jsx('div', { className: `${hintStyle} p-3`, children: catalog.error || 'Choose a profile to browse.' })
       })
     ]
   })

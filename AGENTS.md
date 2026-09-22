@@ -15,10 +15,19 @@ Local operating contract for `HA-Plugins-sidebar-navigator`.
 
 ## Hermes Plugin Catalog & Packaging Standards
 This project complies strictly with the curated Hermes Plugin Catalog standards (`NousResearch/hermes-agent/plugin-catalog`):
-1. **Zero Self-Updating Code:** The plugin loads as static uncompiled ESM. It never attempts self-updates or remote script fetching.
-2. **Exact Commit SHA Pinning:** Catalog releases strictly pin a 40-character lowercase commit SHA (`^[0-9a-f]{40}$`).
-3. **Public Repository with Tagged Releases:** Releases correspond to git tags on the public repository.
-4. **Theme Alignment:** Exclusively consumes Hermes theme CSS variables (`var(--ui-text-*)`, `var(--ui-bg-*)`, `var(--ui-stroke-*)`, `var(--chrome-action-hover)`). Never hardcodes color literals.
+1. **Packaging Structure Contract (Teknium / Hermes Plugin Validator):**
+   - Every desktop plugin directory MUST contain `plugin.yaml` declaring `name`, `version`, `description`, `author`, and capability placeholders.
+   - The desktop bundle MUST sit at `desktop/plugin.js` relative to `plugin.yaml` (the loader's `_LOADABLE_ENTRYPOINTS` rejects bare root `plugin.js` as "nothing to load").
+   - When housed in a subdirectory, the catalog entry MUST set `subdir: desktop-plugin` (or matching directory).
+2. **Two-Phase SHA Pinning (Breaks the Recursive Self-Pin Loop):**
+   - **Phase 1 (Plugin Repo):** Complete code, tests, docs, `plugin.yaml`, and `desktop/plugin.js`. Commit and push to `origin/main`. Record the immutable commit SHA via `git rev-parse HEAD`.
+   - **Phase 2 (Upstream Catalog PR):** In the upstream PR branch on `NousResearch/hermes-agent`, update `plugin-catalog/<id>.yaml` with that exact SHA and `subdir: desktop-plugin`. Validate with `python3 scripts/validate_plugin_catalog.py`, commit, and push.
+3. **Pre-Submission Verification:**
+   - Always run `/home/badi/.hermes/hermes-agent/venv/bin/hermes plugins validate <path-to-plugin-dir>` before submitting.
+4. **Zero Self-Updating Code:** The plugin loads as static uncompiled ESM. It never attempts self-updates or remote script fetching.
+5. **Exact Commit SHA Pinning:** Catalog releases strictly pin a 40-character lowercase commit SHA (`^[0-9a-f]{40}$`).
+6. **Public Repository with Tagged Releases:** Releases correspond to git tags on the public repository.
+7. **Theme Alignment:** Exclusively consumes Hermes theme CSS variables (`var(--ui-text-*)`, `var(--ui-bg-*)`, `var(--ui-stroke-*)`, `var(--chrome-action-hover)`). Never hardcodes color literals.
 
 ## Architecture & Boundaries
 - **Runtime:** Loaded dynamically by Hermes Desktop from `$HERMES_HOME/desktop-plugins/ha-sidebar-navigator/plugin.js`.
