@@ -22,6 +22,19 @@ export const DialogHeader = 'DialogHeader'
 export const DialogTitle = 'DialogTitle'
 export const Input = 'Input'
 export const PROFILE_SWATCHES = []
+export function profileColor(name) {
+  const key = String(name ?? '').trim()
+  if (!key || key === 'default') return null
+  let hash = 0
+  for (let i = 0; i < key.length; i += 1) {
+    hash = (hash * 31 + key.charCodeAt(i)) >>> 0
+  }
+  const hue = hash % 360
+  return `hsl(${hue} 68% 58%)`
+}
+export function profileColorSoft(color, percent = 16) {
+  return `color-mix(in srgb, ${color} ${percent}%, transparent)`
+}
 export const SessionStatusDot = ({ storedSessionId, session, className }) => ({
   type: 'SessionStatusDot',
   props: { storedSessionId, session, className }

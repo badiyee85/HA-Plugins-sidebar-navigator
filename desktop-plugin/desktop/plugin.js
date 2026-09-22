@@ -28,6 +28,8 @@ import {
   Input,
   PALETTE_AREA,
   PROFILE_SWATCHES,
+  profileColor as sdkProfileColor,
+  profileColorSoft as sdkProfileColorSoft,
   ROUTES_AREA,
   SessionStatusDot,
   SIDEBAR_NAV_AREA,
@@ -43,19 +45,24 @@ import { useEffect, useRef, useState } from 'react'
 import { jsx, jsxs } from 'react/jsx-runtime'
 
 export {
+  ProfileGlyph,
   activeRouteFrom,
   duplicateProfileNames,
   focusedOnRoute,
   normalizeRoute,
   normalizeRoutes,
   openSessionForRoute,
+  profileColor,
+  profileColorSoft,
   queryKey,
   reconcileBrowseState,
   reconcileRoute,
   requestForRoute,
+  resolveSessionProfile,
   routeKey,
   routeLabel,
   rowKey,
+  shouldShowProfileBadge,
   storageKey
 }
 
@@ -619,6 +626,66 @@ async function openSessionInNewWindow(sessionId, route) {
   await openSessionSafely(route, sessionId, 'window')
 }
 
+// ── Profile Identity Glyph & Colors ──────────────────────────────────────────
+
+function profileColor(name) {
+  if (typeof sdkProfileColor === 'function') {
+    const res = sdkProfileColor(name)
+    if (res !== undefined) return res
+  }
+  const key = text(name)
+  if (!key || key.toLowerCase() === 'default') return null
+  let hash = 0
+  for (let i = 0; i < key.length; i += 1) {
+    hash = (hash * 31 + key.charCodeAt(i)) >>> 0
+  }
+  const hue = hash % 360
+  return `hsl(${hue} 68% 58%)`
+}
+
+function profileColorSoft(color, percent = 16) {
+  if (typeof sdkProfileColorSoft === 'function') {
+    const res = sdkProfileColorSoft(color, percent)
+    if (res !== undefined) return res
+  }
+  return `color-mix(in srgb, ${color} ${percent}%, transparent)`
+}
+
+function resolveSessionProfile(session, route) {
+  const sProfile = text(session?.profile)
+  if (sProfile) return sProfile
+  const rProfile = text(route?.profile)
+  if (rProfile) return rProfile
+  return 'default'
+}
+
+function shouldShowProfileBadge(profileName) {
+  const key = text(profileName).toLowerCase()
+  return Boolean(key && key !== 'default')
+}
+
+function ProfileGlyph({ name, colorOverride, className }) {
+  const profileKey = text(name)
+  if (!shouldShowProfileBadge(profileKey)) return null
+
+  const initial = profileKey.replace(/[^a-z0-9]/gi, '').charAt(0).toUpperCase() || '?'
+  const color = colorOverride || profileColor(profileKey) || 'var(--ui-text-quaternary)'
+  const bg = profileColorSoft(color, 22)
+  const label = `Owned by profile ${profileKey}`
+
+  return jsx('span', {
+    role: 'img',
+    'aria-label': label,
+    title: label,
+    className: `grid size-4 shrink-0 place-items-center rounded-[3px] text-[0.5rem] font-semibold uppercase leading-none ${className || ''}`.trim(),
+    style: {
+      backgroundColor: bg,
+      color: color
+    },
+    children: initial
+  })
+}
+
 // ── Session Row with Context Menu ───────────────────────────────────────────
 
 function SessionStatusIndicator({ session, route, colorOverride }) {
@@ -700,6 +767,8 @@ function SessionRow({ session, focused, project, allProjects, route }) {
   const busyMap = useValue(host?.state?.busyBySession) || {}
   const isBusy = Boolean(isLocal && session.id && (busyMap[session.id] || (isCurrent && host?.state?.busy && useValue(host?.state?.busy))))
 
+  const sessionProfile = resolveSessionProfile(session, route)
+
   const rowButton = jsxs('button', {
     type: 'button',
     className: isCurrent ? rowBtnActive : rowBtn,
@@ -712,6 +781,7 @@ function SessionRow({ session, focused, project, allProjects, route }) {
         className: 'min-w-0 flex-1 truncate text-left',
         children: session.title || session.preview || session.id
       }),
+      shouldShowProfileBadge(sessionProfile) ? jsx(ProfileGlyph, { name: sessionProfile }) : null,
       meta ? jsx('span', {
         className: 'shrink-0 text-[0.6875rem] text-(--ui-text-quaternary) tabular-nums',
         children: meta
