@@ -777,11 +777,11 @@ function SessionRow({ session, focused, project, allProjects, route }) {
     children: [
       isBusy ? jsx('span', { 'aria-hidden': 'true', className: 'arc-border arc-row' }) : null,
       jsx(SessionStatusIndicator, { session, route, colorOverride }),
+      shouldShowProfileBadge(sessionProfile) ? jsx(ProfileGlyph, { name: sessionProfile }) : null,
       jsx('span', {
         className: 'min-w-0 flex-1 truncate text-left',
         children: session.title || session.preview || session.id
       }),
-      shouldShowProfileBadge(sessionProfile) ? jsx(ProfileGlyph, { name: sessionProfile }) : null,
       meta ? jsx('span', {
         className: 'shrink-0 text-[0.6875rem] text-(--ui-text-quaternary) tabular-nums',
         children: meta
