@@ -46,24 +46,46 @@ import { jsx, jsxs } from 'react/jsx-runtime'
 
 export {
   ProfileGlyph,
+  SessionTagBadges,
+  TagDialog,
+  TagFilterBar,
+  TagPill,
+  WhereDialog,
   activeRouteFrom,
+  addSessionTag,
+  createSessionInProject,
   duplicateProfileNames,
   focusedOnRoute,
+  getAllRouteTags,
+  getSessionTags,
+  matchesSessionFilter,
   normalizeRoute,
   normalizeRoutes,
+  normalizeTag,
   openSessionForRoute,
+  parseSessionQuery,
   profileColor,
   profileColorSoft,
   queryKey,
+  readSessionTagsMap,
   reconcileBrowseState,
   reconcileRoute,
+  removeSessionTag,
   requestForRoute,
+  resolveProjectCwd,
   resolveSessionProfile,
   routeKey,
   routeLabel,
   rowKey,
+  setSessionTags,
   shouldShowProfileBadge,
-  storageKey
+  storageKey,
+  tagColor,
+  tagColorSoft,
+  tagsRevisionAtom,
+  toggleSessionTag,
+  toggleTagInQuery,
+  writeSessionTagsMap
 }
 
 const ID = 'ha-sidebar-navigator'
@@ -102,6 +124,12 @@ function legacyActiveRoute(profile) {
 function isLegacyRoute(route) {
   const normalized = normalizeRoute(route)
   return Boolean(normalized && normalized.connectionId === LEGACY_ACTIVE_CONNECTION && normalized.mode === LEGACY_ROUTE_MODE)
+}
+
+function isLocalRoute(route) {
+  const normalized = normalizeRoute(route)
+  if (!normalized) return false
+  return normalized.mode === 'local' || isLegacyRoute(normalized)
 }
 
 function routeKey(route) {
@@ -516,6 +544,461 @@ async function toggleSessionUnread(sessionId, currentlyUnread, route) {
   return !currentlyUnread
 }
 
+// ─── Session Tags Storage & Utilities ────────────────────────────────────────
+
+const TAGS_STORAGE_BASE = 'hermes.desktop.sessionTags'
+const TAG_MAX_LEN = 32
+const TAGS_PER_SESSION_MAX = 16
+
+const tagsRevisionAtom = atom(0)
+let tagsRevisionCounter = 0
+function bumpTagsRevision() {
+  tagsRevisionCounter += 1
+  tagsRevisionAtom.set(tagsRevisionCounter)
+}
+
+function normalizeTag(input) {
+  if (input == null) return ''
+  return String(input)
+    .normalize('NFKD').replace(/[\u0300-\u036f]/g, '')
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, '-')
+    .replace(/[^a-z0-9_-]/g, '')
+    .replace(/-{2,}/g, '-')
+    .replace(/^-+/, '')
+    .slice(0, TAG_MAX_LEN)
+    .replace(/-+$/, '')
+}
+
+function djb2Hash(str) {
+  let hash = 5381
+  for (let i = 0; i < str.length; i += 1) {
+    hash = ((hash << 5) + hash + str.charCodeAt(i)) >>> 0
+  }
+  return hash
+}
+
+function tagColor(tag) {
+  const t = normalizeTag(tag)
+  if (!t) return 'var(--ui-text-quaternary)'
+  const hue = djb2Hash(t) % 360
+  return `hsl(${hue} 68% 58%)`
+}
+
+function tagColorSoft(color, percent = 16) {
+  return `color-mix(in srgb, ${color} ${percent}%, transparent)`
+}
+
+function tagsKey(route) {
+  return storageKey(TAGS_STORAGE_BASE, route)
+}
+
+function sanitizeTagList(list) {
+  if (!Array.isArray(list)) return []
+  const out = []
+  const seen = new Set()
+  for (const item of list) {
+    const n = normalizeTag(item)
+    if (n && !seen.has(n)) {
+      seen.add(n)
+      out.push(n)
+      if (out.length >= TAGS_PER_SESSION_MAX) break
+    }
+  }
+  return out
+}
+
+function readSessionTagsMap(route) {
+  const key = tagsKey(route)
+  if (!key) return {}
+  try {
+    const raw = typeof window !== 'undefined' && window.localStorage
+      ? window.localStorage.getItem(key)
+      : (typeof globalThis !== 'undefined' && globalThis.localStorage ? globalThis.localStorage.getItem(key) : null)
+    if (!raw) return {}
+    const parsed = JSON.parse(raw)
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      const cleanMap = {}
+      for (const [id, list] of Object.entries(parsed)) {
+        const clean = sanitizeTagList(list)
+        if (clean.length) cleanMap[id] = clean
+      }
+      return cleanMap
+    }
+    return {}
+  } catch {
+    return {}
+  }
+}
+
+function writeSessionTagsMap(route, map) {
+  const key = tagsKey(route)
+  if (!key) return
+  const cleanMap = {}
+  for (const [id, list] of Object.entries(map || {})) {
+    const clean = sanitizeTagList(list)
+    if (clean.length) cleanMap[id] = clean
+  }
+  try {
+    const storage = typeof window !== 'undefined' && window.localStorage
+      ? window.localStorage
+      : (typeof globalThis !== 'undefined' && globalThis.localStorage ? globalThis.localStorage : null)
+    if (storage) {
+      if (Object.keys(cleanMap).length === 0) {
+        storage.removeItem(key)
+      } else {
+        storage.setItem(key, JSON.stringify(cleanMap))
+      }
+    }
+  } catch (err) {
+    console.warn('[ha-sidebar-navigator] Failed to write session tags:', err)
+  }
+  bumpTagsRevision()
+}
+
+function getSessionTags(sessionId, route) {
+  if (!sessionId) return []
+  const map = readSessionTagsMap(route)
+  return map[sessionId] || []
+}
+
+function setSessionTags(sessionId, tags, route) {
+  if (!sessionId) return
+  const map = readSessionTagsMap(route)
+  const clean = sanitizeTagList(tags)
+  if (clean.length === 0) {
+    delete map[sessionId]
+  } else {
+    map[sessionId] = clean
+  }
+  writeSessionTagsMap(route, map)
+}
+
+function addSessionTag(sessionId, tag, route) {
+  const n = normalizeTag(tag)
+  if (!sessionId || !n) return false
+  const cur = getSessionTags(sessionId, route)
+  if (cur.includes(n)) return true
+  if (cur.length >= TAGS_PER_SESSION_MAX) return false
+  setSessionTags(sessionId, [...cur, n], route)
+  return true
+}
+
+function removeSessionTag(sessionId, tag, route) {
+  const n = normalizeTag(tag)
+  if (!sessionId || !n) return
+  const cur = getSessionTags(sessionId, route)
+  if (!cur.includes(n)) return
+  setSessionTags(sessionId, cur.filter(t => t !== n), route)
+}
+
+function toggleSessionTag(sessionId, tag, route) {
+  const n = normalizeTag(tag)
+  if (!sessionId || !n) return
+  const cur = getSessionTags(sessionId, route)
+  if (cur.includes(n)) {
+    removeSessionTag(sessionId, n, route)
+  } else {
+    addSessionTag(sessionId, n, route)
+  }
+}
+
+function getAllRouteTags(route) {
+  const map = readSessionTagsMap(route)
+  const s = new Set()
+  for (const tags of Object.values(map)) {
+    for (const t of tags) s.add(t)
+  }
+  return [...s].sort()
+}
+
+// ─── Query Parsing & Filter Matching ─────────────────────────────────────────
+
+function parseSessionQuery(query) {
+  const q = String(query || '').trim()
+  if (!q) return { tags: [], text: [] }
+  const tags = []
+  const text = []
+  const parts = q.split(/\s+/)
+  for (const part of parts) {
+    if (!part) continue
+    if (part.startsWith('#')) {
+      const t = normalizeTag(part.slice(1))
+      if (t && !tags.includes(t)) tags.push(t)
+    } else {
+      text.push(part.toLowerCase())
+    }
+  }
+  return { tags, text }
+}
+
+function matchesSessionFilter(session, query, tags, legacyMatch) {
+  const q = String(query || '').trim()
+  if (!q) return true
+  const { tags: reqTags, text } = parseSessionQuery(q)
+
+  if (reqTags.length > 0) {
+    const sessionTags = tags || []
+    for (const t of reqTags) {
+      if (!sessionTags.includes(t)) return false
+    }
+  }
+
+  if (text.length > 0) {
+    if (typeof legacyMatch === 'function') {
+      return legacyMatch(session, text.join(' '))
+    }
+    const searchable = `${session?.title || ''} ${session?.preview || ''} ${session?.id || ''}`.toLowerCase()
+    for (const term of text) {
+      if (!searchable.includes(term)) return false
+    }
+  }
+
+  return true
+}
+
+function toggleTagInQuery(query, tag) {
+  const n = normalizeTag(tag)
+  if (!n) return query || ''
+  const { tags, text } = parseSessionQuery(query || '')
+  const idx = tags.indexOf(n)
+  if (idx >= 0) {
+    tags.splice(idx, 1)
+  } else {
+    tags.push(n)
+  }
+  const parts = [...text, ...tags.map(t => `#${t}`)]
+  return parts.join(' ')
+}
+
+// ─── Tag UI Components ───────────────────────────────────────────────────────
+
+function TagPill({ tag, active = false, onClick, onRemove, className, title }) {
+  const n = normalizeTag(tag)
+  if (!n) return null
+  const color = tagColor(n)
+  const bg = tagColorSoft(color, active ? 28 : 14)
+
+  const handleClick = (e) => {
+    if (onClick) {
+      e.stopPropagation()
+      onClick(n)
+    }
+  }
+
+  return jsxs('span', {
+    role: onClick ? 'button' : undefined,
+    tabIndex: onClick ? 0 : undefined,
+    onClick: handleClick,
+    title: title || (active ? `Active tag filter: #${n}` : `Filter by #${n}`),
+    className: `inline-flex items-center gap-1 rounded-[3px] px-1.5 py-0.2 text-[0.625rem] font-medium leading-none select-none transition-colors border ${
+      active
+        ? 'border-(--ui-accent) text-(--ui-text-primary)'
+        : 'border-transparent text-(--ui-text-secondary) hover:text-(--ui-text-primary)'
+    } ${onClick ? 'cursor-pointer hover:bg-(--chrome-action-hover)' : ''} ${className || ''}`.trim(),
+    style: {
+      backgroundColor: bg,
+      borderColor: active ? color : undefined,
+      color: active ? color : undefined
+    },
+    children: [
+      jsx('span', {
+        className: 'inline-block h-1.5 w-1.5 shrink-0 rounded-full',
+        style: { backgroundColor: color }
+      }),
+      jsx('span', { className: 'truncate max-w-[80px]', children: n }),
+      onRemove ? jsx('button', {
+        type: 'button',
+        title: `Remove tag ${n}`,
+        className: 'hover:text-destructive p-0.5 leading-none',
+        onClick: (e) => {
+          e.stopPropagation()
+          onRemove(n)
+        },
+        children: '×'
+      }) : null
+    ]
+  })
+}
+
+function SessionTagBadges({ tags, maxVisible = 2, onTagClick, className }) {
+  if (!tags || !tags.length) return null
+  const visible = tags.slice(0, maxVisible)
+  const hiddenCount = tags.length - visible.length
+
+  return jsxs('div', {
+    className: `inline-flex items-center gap-1 shrink-0 ${className || ''}`.trim(),
+    children: [
+      visible.map(t => jsx(TagPill, {
+        tag: t,
+        onClick: onTagClick
+      }, t)),
+      hiddenCount > 0 ? jsx('span', {
+        className: 'text-[0.625rem] font-medium text-(--ui-text-quaternary) tabular-nums',
+        title: tags.slice(maxVisible).join(', '),
+        children: `+${hiddenCount}`
+      }) : null
+    ]
+  })
+}
+
+function TagFilterBar({ route, className }) {
+  useValue(tagsRevisionAtom)
+  const currentQuery = useValue(queryAtom)
+  const { tags: activeTags } = parseSessionQuery(currentQuery)
+  const availableTags = getAllRouteTags(route)
+
+  if (!availableTags || availableTags.length === 0) return null
+
+  const handleTagToggle = (tag) => {
+    const next = toggleTagInQuery(currentQuery, tag)
+    queryAtom.set(next)
+  }
+
+  return jsxs('div', {
+    className: `flex items-center gap-1 overflow-x-auto py-1 px-0.5 no-scrollbar ${className || ''}`.trim(),
+    children: [
+      jsx('span', {
+        className: 'text-[0.625rem] font-semibold text-(--ui-text-quaternary) uppercase tracking-wider shrink-0 pl-1',
+        children: 'Tags:'
+      }),
+      availableTags.map(t => jsx(TagPill, {
+        tag: t,
+        active: activeTags.includes(t),
+        onClick: () => handleTagToggle(t)
+      }, t))
+    ]
+  })
+}
+
+function TagDialog({ open, onOpenChange, session, route }) {
+  useValue(tagsRevisionAtom)
+  const [inputVal, setInputVal] = useState('')
+  const sessionId = session?.id
+  const assignedTags = sessionId ? getSessionTags(sessionId, route) : []
+  const availableTags = getAllRouteTags(route)
+
+  const handleAdd = (tagToAdd) => {
+    const n = normalizeTag(tagToAdd || inputVal)
+    if (!n || !sessionId) return
+    addSessionTag(sessionId, n, route)
+    setInputVal('')
+  }
+
+  const handleRemove = (tagToRemove) => {
+    if (!sessionId) return
+    removeSessionTag(sessionId, tagToRemove, route)
+  }
+
+  const handleToggle = (tagToToggle) => {
+    if (!sessionId) return
+    toggleSessionTag(sessionId, tagToToggle, route)
+  }
+
+  return jsx(Dialog, {
+    open,
+    onOpenChange: (val) => {
+      onOpenChange(val)
+      if (!val) setInputVal('')
+    },
+    children: jsxs(DialogContent, {
+      className: 'max-w-sm p-4',
+      children: [
+        jsxs(DialogHeader, {
+          children: [
+            jsx(DialogTitle, { children: 'Manage Tags' }),
+            jsx('p', {
+              className: 'text-xs text-(--ui-text-quaternary) mt-0.5 truncate',
+              children: session?.title || session?.preview || session?.id || 'Session'
+            })
+          ]
+        }),
+
+        // Assigned Tags
+        jsxs('div', {
+          className: 'mt-3 mb-2',
+          children: [
+            jsx('div', {
+              className: 'text-xs font-semibold text-(--ui-text-secondary) mb-1.5',
+              children: 'Assigned Tags'
+            }),
+            assignedTags.length === 0
+              ? jsx('p', { className: 'text-xs text-(--ui-text-quaternary) italic', children: 'No tags assigned yet.' })
+              : jsx('div', {
+                  className: 'flex flex-wrap gap-1.5',
+                  children: assignedTags.map(t => jsx(TagPill, {
+                    tag: t,
+                    active: true,
+                    onRemove: () => handleRemove(t)
+                  }, t))
+                })
+          ]
+        }),
+
+        // Add Tag Input
+        jsxs('div', {
+          className: 'mt-3 flex gap-1.5',
+          children: [
+            jsx(Input, {
+              autoFocus: true,
+              placeholder: 'New tag name…',
+              value: inputVal,
+              onChange: (e) => setInputVal(e.target.value),
+              onKeyDown: (e) => {
+                if (e.key === 'Enter' && !e.nativeEvent.isComposing) {
+                  e.preventDefault()
+                  handleAdd()
+                }
+              },
+              className: 'flex-1 text-xs'
+            }),
+            jsx(Button, {
+              type: 'button',
+              disabled: !inputVal.trim(),
+              onClick: () => handleAdd(),
+              children: 'Add'
+            })
+          ]
+        }),
+
+        // Quick Pick from existing route tags
+        availableTags.filter(t => !assignedTags.includes(t)).length > 0 ? jsxs('div', {
+          className: 'mt-3 border-t border-(--ui-stroke-secondary) pt-2',
+          children: [
+            jsx('div', {
+              className: 'text-[0.6875rem] font-medium text-(--ui-text-quaternary) mb-1',
+              children: 'Quick add existing tag:'
+            }),
+            jsx('div', {
+              className: 'flex flex-wrap gap-1 max-h-24 overflow-y-auto',
+              children: availableTags.filter(t => !assignedTags.includes(t)).map(t => jsx('button', {
+                type: 'button',
+                key: t,
+                onClick: () => handleAdd(t),
+                className: 'rounded border border-(--ui-stroke-secondary) px-1.5 py-0.5 text-xs text-(--ui-text-secondary) hover:text-(--ui-text-primary) hover:bg-(--chrome-action-hover) transition-colors',
+                children: `+ ${t}`
+              }))
+            })
+          ]
+        }) : null,
+
+        jsxs(DialogFooter, {
+          className: 'mt-4 pt-2 border-t border-(--ui-stroke-secondary) flex justify-end',
+          children: [
+            jsx(Button, {
+              type: 'button',
+              variant: 'ghost',
+              onClick: () => onOpenChange(false),
+              children: 'Done'
+            })
+          ]
+        })
+      ]
+    })
+  })
+}
+
 function copySessionId(sessionId) {
   if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
     navigator.clipboard.writeText(sessionId).then(() => {
@@ -624,6 +1107,159 @@ async function deleteSession(sessionId, route) {
 
 async function openSessionInNewWindow(sessionId, route) {
   await openSessionSafely(route, sessionId, 'window')
+}
+
+// ── Project-Scoped Session Creation & "Where?" Dialog ────────────────────────
+
+function resolveProjectCwd(project) {
+  if (!project || project.isNoProject) return null
+  return (project.path || project.repos?.find(r => r.path)?.path || '').trim() || null
+}
+
+async function createSessionInProject(targetProject, route) {
+  const label = targetProject?.isNoProject || !targetProject
+    ? 'Home'
+    : (targetProject.label || targetProject.name || targetProject.id)
+  try {
+    const targetCwd = resolveProjectCwd(targetProject)
+    const params = {}
+    if (targetCwd !== null) {
+      params.cwd = targetCwd
+    }
+    const result = await mutateForRoute(route, 'session.create', params)
+    const newId = result?.stored_session_id || result?.session_key || result?.session_id
+    if (!newId) throw new Error('Create session did not return a session id')
+    invalidateRoute(route)
+    await openSessionForRoute(route, newId, 'in-place')
+    host.notify({ kind: 'success', message: `Started new session in ${label}` })
+    return newId
+  } catch (err) {
+    host.notifyError?.(err, `Failed to create session in ${label}`)
+    throw err
+  }
+}
+
+function WhereDialog({ open, onOpenChange, projects = [], route }) {
+  const [filter, setFilter] = useState('')
+  const q = filter.trim().toLowerCase()
+
+  const homeItem = {
+    id: '__home__',
+    isNoProject: true,
+    label: 'Home',
+    path: null
+  }
+
+  const projectItems = projects.filter(p => !p.isNoProject)
+  const filteredProjects = q
+    ? projectItems.filter(p => {
+        const name = (p.label || p.name || p.id || '').toLowerCase()
+        const path = (p.path || '').toLowerCase()
+        return name.includes(q) || path.includes(q)
+      })
+    : projectItems
+
+  const handleSelect = async (target) => {
+    onOpenChange(false)
+    setFilter('')
+    await createSessionInProject(target, route).catch(() => {})
+  }
+
+  return jsx(Dialog, {
+    open,
+    onOpenChange: (val) => {
+      onOpenChange(val)
+      if (!val) setFilter('')
+    },
+    children: jsxs(DialogContent, {
+      className: 'max-w-md p-4',
+      children: [
+        jsxs(DialogHeader, {
+          children: [
+            jsx(DialogTitle, { children: 'Start New Session' }),
+            jsx('p', {
+              className: 'text-xs text-(--ui-text-quaternary) mt-0.5',
+              children: 'Where would you like to create this session?'
+            })
+          ]
+        }),
+        jsx(Input, {
+          autoFocus: true,
+          placeholder: 'Filter projects…',
+          value: filter,
+          onChange: (e) => setFilter(e.target.value),
+          className: 'mt-2 mb-2 w-full text-xs'
+        }),
+        jsxs('div', {
+          className: 'max-h-64 min-h-24 overflow-y-auto space-y-1 pr-1',
+          children: [
+            // Home (Always available at top unless filtered specifically out)
+            (!q || 'home'.includes(q)) ? jsx('button', {
+              type: 'button',
+              className: 'flex w-full items-center gap-2 rounded px-2.5 py-1.5 text-left text-xs hover:bg-(--chrome-action-hover) transition-colors border border-transparent hover:border-(--ui-stroke-secondary)',
+              onClick: () => void handleSelect(homeItem),
+              children: [
+                jsx(IconOr, { icon: 'Home', glyph: '🏠' }),
+                jsxs('div', {
+                  className: 'min-w-0 flex-1',
+                  children: [
+                    jsx('div', { className: 'font-semibold text-(--ui-text-primary)', children: 'Home' }),
+                    jsx('div', { className: 'text-[0.6875rem] text-(--ui-text-quaternary) truncate', children: 'No workspace · general chat' })
+                  ]
+                })
+              ]
+            }) : null,
+
+            // Filtered Projects
+            filteredProjects.map(proj => {
+              const name = proj.label || proj.name || proj.id
+              const pCwd = resolveProjectCwd(proj)
+              return jsx('button', {
+                key: proj.id,
+                type: 'button',
+                className: 'flex w-full items-center gap-2 rounded px-2.5 py-1.5 text-left text-xs hover:bg-(--chrome-action-hover) transition-colors border border-transparent hover:border-(--ui-stroke-secondary)',
+                onClick: () => void handleSelect(proj),
+                children: [
+                  proj.color
+                    ? jsx('span', {
+                        className: 'h-2.5 w-2.5 shrink-0 rounded-full',
+                        style: { backgroundColor: proj.color }
+                      })
+                    : jsx(IconOr, { icon: 'Folder', glyph: '📁' }),
+                  jsxs('div', {
+                    className: 'min-w-0 flex-1',
+                    children: [
+                      jsx('div', { className: 'font-semibold text-(--ui-text-primary) truncate', children: name }),
+                      pCwd ? jsx('div', { className: 'text-[0.6875rem] text-(--ui-text-quaternary) truncate', children: pCwd }) : null
+                    ]
+                  })
+                ]
+              })
+            }),
+
+            (filteredProjects.length === 0 && (!q || !'home'.includes(q))) ? jsx('div', {
+              className: `${hintStyle} py-3 text-center`,
+              children: 'No matching projects found'
+            }) : null
+          ]
+        }),
+        jsxs(DialogFooter, {
+          className: 'mt-3 pt-2 border-t border-(--ui-stroke-secondary) flex justify-end',
+          children: [
+            jsx(Button, {
+              type: 'button',
+              variant: 'ghost',
+              onClick: () => {
+                onOpenChange(false)
+                setFilter('')
+              },
+              children: 'Cancel'
+            })
+          ]
+        })
+      ]
+    })
+  })
 }
 
 // ── Profile Identity Glyph & Colors ──────────────────────────────────────────
@@ -768,6 +1404,9 @@ function SessionRow({ session, focused, project, allProjects, route }) {
   const isBusy = Boolean(isLocal && session.id && (busyMap[session.id] || (isCurrent && host?.state?.busy && useValue(host?.state?.busy))))
 
   const sessionProfile = resolveSessionProfile(session, route)
+  const [tagDialogOpen, setTagDialogOpen] = useState(false)
+  useValue(tagsRevisionAtom)
+  const sessionTags = session.id ? getSessionTags(session.id, route) : []
 
   const rowButton = jsxs('button', {
     type: 'button',
@@ -782,6 +1421,13 @@ function SessionRow({ session, focused, project, allProjects, route }) {
         className: 'min-w-0 flex-1 truncate text-left',
         children: session.title || session.preview || session.id
       }),
+      sessionTags.length > 0 ? jsx(SessionTagBadges, {
+        tags: sessionTags,
+        maxVisible: 2,
+        onTagClick: (tag) => {
+          queryAtom.set(toggleTagInQuery(queryAtom.get(), tag))
+        }
+      }) : null,
       meta ? jsx('span', {
         className: 'shrink-0 text-[0.6875rem] text-(--ui-text-quaternary) tabular-nums',
         children: meta
@@ -900,8 +1546,27 @@ function SessionRow({ session, focused, project, allProjects, route }) {
                   jsx('span', { children: 'Copy ID' })
                 ]
               }),
+              // 6b. Tags
+              jsxs(ContextMenuItem, {
+                onSelect: () => {
+                  haptic?.('selection')
+                  setTagDialogOpen(true)
+                },
+                children: [
+                  jsx(Codicon, { name: 'tag', size: '0.875rem' }),
+                  jsx('span', { children: 'Tags…' })
+                ]
+              }),
               // Separator 1
               jsx(ContextMenuSeparator, {}),
+              // New session in this project (if within project)
+              (project && !project.isNoProject) ? jsxs(ContextMenuItem, {
+                onSelect: () => void createSessionInProject(project, route),
+                children: [
+                  jsx(Codicon, { name: 'add', size: '0.875rem' }),
+                  jsx('span', { children: `New session in ${project.label || project.name || project.id}` })
+                ]
+              }) : null,
               // 7. Branch
               jsxs(ContextMenuItem, {
                 onSelect: () => void branchSession(session, route),
@@ -1021,6 +1686,13 @@ function SessionRow({ session, focused, project, allProjects, route }) {
         confirmLabel: 'Delete',
         destructive: true,
         onConfirm: () => deleteSession(session.id, route)
+      }),
+      // Tag Management Dialog
+      jsx(TagDialog, {
+        open: tagDialogOpen,
+        onOpenChange: setTagDialogOpen,
+        session,
+        route
       })
     ]
   })
@@ -1029,8 +1701,10 @@ function SessionRow({ session, focused, project, allProjects, route }) {
 // ── Sessions Flattened View ──────────────────────────────────────────────────
 
 function SessionBrowser({ route }) {
-  const q = useValue(queryAtom).trim().toLowerCase()
+  useValue(tagsRevisionAtom)
+  const q = useValue(queryAtom).trim()
   const currentId = useValue(focusAtom)
+  const tagsMap = readSessionTagsMap(route)
 
   const listQuery = useQuery({
     queryKey: queryKey('sessions', route),
@@ -1052,16 +1726,15 @@ function SessionBrowser({ route }) {
   const filtered = rawSessions
     .filter((s) => (s.message_count ?? 0) > 0)
     .filter((s) => {
-      if (!q) return true
-      return (s.title || '').toLowerCase().includes(q) ||
-             (s.preview || '').toLowerCase().includes(q) ||
-             (s.id || '').toLowerCase().includes(q)
+      const sTags = tagsMap[s.id] || []
+      return matchesSessionFilter(s, q, sTags)
     })
     .sort((a, b) => (b.started_at ?? 0) - (a.started_at ?? 0))
 
   return jsxs('div', {
     className: 'flex min-h-0 flex-1 flex-col overflow-hidden',
     children: [
+      jsx(TagFilterBar, { route, className: 'px-2 pb-1 border-b border-(--ui-stroke-secondary)' }),
       jsx('div', {
         className: `${hintStyle} px-3 py-1`,
         children: listQuery.status === 'pending'
@@ -1117,12 +1790,13 @@ function ProjectCard({ project, allProjects, currentId, filterQuery, route }) {
     ? extractSessionsFromProjectTree(fullQuery.data?.project)
     : preview
 
+  const tagsMap = readSessionTagsMap(route)
+
   if (filterQuery) {
-    sessions = sessions.filter((s) =>
-      (s.title || '').toLowerCase().includes(filterQuery) ||
-      (s.preview || '').toLowerCase().includes(filterQuery) ||
-      (s.id || '').toLowerCase().includes(filterQuery)
-    )
+    sessions = sessions.filter((s) => {
+      const sTags = tagsMap[s.id] || []
+      return matchesSessionFilter(s, filterQuery, sTags)
+    })
   }
 
   const hasTruncated = !loadAll && totalCount > preview.length
@@ -1133,59 +1807,120 @@ function ProjectCard({ project, allProjects, currentId, filterQuery, route }) {
     ? (sessions || []).filter(s => s?.id && busyMap[s.id]).length
     : 0
 
+  const projectLabel = project.isNoProject ? 'Home' : (project.label || project.name || project.id)
+  const projectCwd = resolveProjectCwd(project)
+
+  const headerRow = jsxs('div', {
+    className: 'flex w-full items-center gap-1.5 px-2 py-1 cursor-pointer select-none rounded hover:bg-(--chrome-action-hover)',
+    onClick: () => setExpanded(!expanded),
+    children: [
+      jsx('button', {
+        type: 'button',
+        className: 'text-(--ui-text-quaternary) hover:text-(--ui-text-primary) p-0.5',
+        children: jsx(IconOr, {
+          icon: expanded ? 'ChevronDown' : 'ChevronRight',
+          glyph: expanded ? '▼' : '▶'
+        })
+      }),
+      project.color
+        ? jsx('span', {
+            className: 'h-2.5 w-2.5 shrink-0 rounded-full',
+            style: { backgroundColor: project.color }
+          })
+        : project.isNoProject
+          ? jsx(IconOr, { icon: 'Home', glyph: '🏠' })
+          : jsx(IconOr, { icon: 'Folder', glyph: '📁' }),
+      jsx('span', {
+        className: 'min-w-0 flex-1 truncate text-xs font-semibold uppercase tracking-wider text-(--ui-text-primary)',
+        children: projectLabel
+      }),
+      activeCount > 0 ? jsx('span', {
+        className: 'shrink-0 flex items-center gap-1 rounded-full bg-(--ui-accent)/15 px-1.5 py-0.2 text-[0.625rem] font-medium text-(--ui-accent)',
+        title: `${activeCount} active session${activeCount === 1 ? '' : 's'}`,
+        children: [
+          jsx('span', { className: 'inline-block h-1.5 w-1.5 rounded-full bg-(--ui-accent)' }),
+          jsx('span', { children: `${activeCount} active` })
+        ]
+      }) : null,
+      jsx('button', {
+        type: 'button',
+        className: 'shrink-0 flex items-center gap-1 rounded px-1.5 py-0.5 text-[0.6875rem] font-medium text-(--ui-text-secondary) hover:text-(--ui-text-primary) hover:bg-(--chrome-action-hover) border border-(--ui-stroke-secondary) transition-colors',
+        title: `New session in ${projectLabel}`,
+        onClick: (e) => {
+          e.stopPropagation()
+          void createSessionInProject(project, route)
+        },
+        children: [
+          jsx(Codicon, { name: 'add', size: '0.75rem' }),
+          jsx('span', { className: 'hidden sm:inline', children: 'New' })
+        ]
+      }),
+      !project.isNoProject ? jsx('button', {
+        type: 'button',
+        className: 'shrink-0 flex items-center gap-1 rounded px-1.5 py-0.5 text-[0.6875rem] font-medium text-(--ui-text-secondary) hover:text-(--ui-text-primary) hover:bg-(--chrome-action-hover) border border-(--ui-stroke-secondary) transition-colors',
+        title: `Open Cockpit for ${projectLabel}`,
+        onClick: (e) => {
+          e.stopPropagation()
+          const slug = project.id || project.name || project.label || ''
+          host.navigate(`/cockpit?project=${encodeURIComponent(slug)}`)
+        },
+        children: [
+          jsx(IconOr, { icon: 'Zap', glyph: '⚡' }),
+          jsx('span', { className: 'hidden sm:inline', children: 'Cockpit' })
+        ]
+      }) : null,
+      jsx('span', {
+        className: 'shrink-0 text-[0.6875rem] font-medium text-(--ui-text-quaternary) tabular-nums',
+        children: String(totalCount)
+      })
+    ]
+  })
+
   return jsxs('div', {
     className: 'mb-3 rounded-lg border border-(--ui-stroke-secondary) bg-(--ui-bg-subtle)/30 p-1.5',
     children: [
-      // Project Header
-      jsxs('div', {
-        className: 'flex w-full items-center gap-1.5 px-2 py-1 cursor-pointer select-none rounded hover:bg-(--chrome-action-hover)',
-        onClick: () => setExpanded(!expanded),
+      // Project Header with Context Menu
+      jsxs(ContextMenu, {
         children: [
-          jsx('button', {
-            type: 'button',
-            className: 'text-(--ui-text-quaternary) hover:text-(--ui-text-primary) p-0.5',
-            children: jsx(IconOr, {
-              icon: expanded ? 'ChevronDown' : 'ChevronRight',
-              glyph: expanded ? '▼' : '▶'
-            })
+          jsx(ContextMenuTrigger, {
+            asChild: true,
+            children: headerRow
           }),
-          project.color
-            ? jsx('span', {
-                className: 'h-2.5 w-2.5 shrink-0 rounded-full',
-                style: { backgroundColor: project.color }
-              })
-            : project.isNoProject
-              ? jsx(IconOr, { icon: 'Home', glyph: '🏠' })
-              : jsx(IconOr, { icon: 'Folder', glyph: '📁' }),
-          jsx('span', {
-            className: 'min-w-0 flex-1 truncate text-xs font-semibold uppercase tracking-wider text-(--ui-text-primary)',
-            children: project.isNoProject ? 'Home' : (project.label || project.name || project.id)
-          }),
-          activeCount > 0 ? jsx('span', {
-            className: 'shrink-0 flex items-center gap-1 rounded-full bg-(--ui-accent)/15 px-1.5 py-0.2 text-[0.625rem] font-medium text-(--ui-accent)',
-            title: `${activeCount} active session${activeCount === 1 ? '' : 's'}`,
+          jsxs(ContextMenuContent, {
+            className: 'w-48',
             children: [
-              jsx('span', { className: 'inline-block h-1.5 w-1.5 rounded-full bg-(--ui-accent)' }),
-              jsx('span', { children: `${activeCount} active` })
+              jsxs(ContextMenuItem, {
+                onSelect: () => void createSessionInProject(project, route),
+                children: [
+                  jsx(Codicon, { name: 'add', size: '0.875rem' }),
+                  jsx('span', { children: `New session in ${projectLabel}` })
+                ]
+              }),
+              !project.isNoProject ? jsxs(ContextMenuItem, {
+                onSelect: () => {
+                  const slug = project.id || project.name || project.label || ''
+                  host.navigate(`/cockpit?project=${encodeURIComponent(slug)}`)
+                },
+                children: [
+                  jsx(Codicon, { name: 'zap', size: '0.875rem' }),
+                  jsx('span', { children: 'Open Cockpit' })
+                ]
+              }) : null,
+              projectCwd ? jsxs(ContextMenuItem, {
+                onSelect: () => {
+                  if (typeof window !== 'undefined' && window.hermesDesktop?.writeClipboard) {
+                    window.hermesDesktop.writeClipboard(projectCwd)
+                  } else if (typeof navigator !== 'undefined' && navigator.clipboard) {
+                    navigator.clipboard.writeText(projectCwd)
+                  }
+                  host.notify({ kind: 'success', message: 'Project path copied to clipboard' })
+                },
+                children: [
+                  jsx(Codicon, { name: 'copy', size: '0.875rem' }),
+                  jsx('span', { children: 'Copy path' })
+                ]
+              }) : null
             ]
-          }) : null,
-          !project.isNoProject ? jsx('button', {
-            type: 'button',
-            className: 'shrink-0 flex items-center gap-1 rounded px-1.5 py-0.5 text-[0.6875rem] font-medium text-(--ui-text-secondary) hover:text-(--ui-text-primary) hover:bg-(--chrome-action-hover) border border-(--ui-stroke-secondary) transition-colors',
-            title: `Open Cockpit for ${project.label || project.name || project.id}`,
-            onClick: (e) => {
-              e.stopPropagation()
-              const slug = project.id || project.name || project.label || ''
-              host.navigate(`/cockpit?project=${encodeURIComponent(slug)}`)
-            },
-            children: [
-              jsx(IconOr, { icon: 'Zap', glyph: '⚡' }),
-              jsx('span', { className: 'hidden sm:inline', children: 'Cockpit' })
-            ]
-          }) : null,
-          jsx('span', {
-            className: 'shrink-0 text-[0.6875rem] font-medium text-(--ui-text-quaternary) tabular-nums',
-            children: String(totalCount)
           })
         ]
       }),
@@ -1217,7 +1952,8 @@ function ProjectCard({ project, allProjects, currentId, filterQuery, route }) {
 }
 
 function ProjectBrowser({ route }) {
-  const q = useValue(queryAtom).trim().toLowerCase()
+  useValue(tagsRevisionAtom)
+  const q = useValue(queryAtom).trim()
   const currentId = useValue(focusAtom)
 
   const treeQuery = useQuery({
@@ -1248,11 +1984,17 @@ function ProjectBrowser({ route }) {
     return jsx('div', { className: `${hintStyle} p-3`, children: 'No projects registered on this profile.' })
   }
 
-  return jsx('div', {
-    className: 'min-h-0 flex-1 overflow-y-auto px-2 py-1.5',
-    children: projects.map((p) =>
-      jsx(ProjectCard, { project: p, allProjects: projects, currentId, filterQuery: q, route }, `${routeKey(route)}/${p.id}`)
-    )
+  return jsxs('div', {
+    className: 'flex min-h-0 flex-1 flex-col overflow-hidden',
+    children: [
+      jsx(TagFilterBar, { route, className: 'px-2 pb-1 border-b border-(--ui-stroke-secondary)' }),
+      jsx('div', {
+        className: 'min-h-0 flex-1 overflow-y-auto px-2 py-1.5',
+        children: projects.map((p) =>
+          jsx(ProjectCard, { project: p, allProjects: projects, currentId, filterQuery: q, route }, `${routeKey(route)}/${p.id}`)
+        )
+      })
+    ]
   })
 }
 
@@ -1374,6 +2116,16 @@ function NavigatorShell() {
   const catalog = useRouteCatalog(connectionId, profile)
   const activeRoute = activeRouteFrom(catalog.routes, connectionId, profile)
   const selectedRoute = browse.selected || (!browse.manual ? activeRoute : null)
+  const [whereOpen, setWhereOpen] = useState(false)
+
+  // Query projects for WhereDialog when route is selected
+  const projectsQuery = useQuery({
+    queryKey: queryKey(selectedRoute, 'projects.tree'),
+    queryFn: () => requestForRoute(selectedRoute, 'projects.tree'),
+    enabled: Boolean(selectedRoute && whereOpen),
+    staleTime: ROUTE_CACHE_TTL_MS
+  })
+  const availableProjects = (projectsQuery.data?.projects || [])
 
   return jsxs('div', {
     className: 'flex h-full min-h-0 flex-col bg-(--ui-bg-primary) text-(--ui-text-primary)',
@@ -1402,13 +2154,26 @@ function NavigatorShell() {
                   })
                 ]
               }),
-              jsx('button', {
-                type: 'button',
-                className: chipBtn,
-                disabled: !selectedRoute,
-                title: selectedRoute ? `Refresh ${routeLabel(selectedRoute)}` : 'Choose a profile first',
-                onClick: () => selectedRoute && invalidateRoute(selectedRoute),
-                children: jsx(IconOr, { icon: 'RefreshCw', glyph: '↻' })
+              jsxs('div', {
+                className: 'flex items-center gap-1',
+                children: [
+                  jsx('button', {
+                    type: 'button',
+                    className: chipBtn,
+                    disabled: !selectedRoute,
+                    title: 'New session (choose location)',
+                    onClick: () => setWhereOpen(true),
+                    children: jsx(Codicon, { name: 'add', size: '0.875rem' })
+                  }),
+                  jsx('button', {
+                    type: 'button',
+                    className: chipBtn,
+                    disabled: !selectedRoute,
+                    title: selectedRoute ? `Refresh ${routeLabel(selectedRoute)}` : 'Choose a profile first',
+                    onClick: () => selectedRoute && invalidateRoute(selectedRoute),
+                    children: jsx(IconOr, { icon: 'RefreshCw', glyph: '↻' })
+                  })
+                ]
               })
             ]
           }),
@@ -1420,6 +2185,12 @@ function NavigatorShell() {
             className: 'w-full rounded-md border border-(--ui-stroke-secondary) bg-(--ui-bg-subtle) px-2.5 py-1 text-xs text-(--ui-text-primary) outline-none placeholder:text-(--ui-text-quaternary) focus:border-(--ui-accent)'
           })
         ]
+      }),
+      jsx(WhereDialog, {
+        open: whereOpen,
+        onOpenChange: setWhereOpen,
+        projects: availableProjects,
+        route: selectedRoute
       }),
       jsx('div', {
         className: 'min-h-0 flex flex-1 flex-col overflow-hidden',

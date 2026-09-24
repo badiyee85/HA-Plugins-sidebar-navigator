@@ -51,14 +51,40 @@ export const host = {
     awaitingResponse: makeAtom(false),
     busyBySession: makeAtom({})
   },
-  request: async () => ({}),
-  requestProfile: undefined,
+  request: async (method, params) => {
+    if (activeRouteMockHandler) return activeRouteMockHandler(method, params)
+    return {}
+  },
+  requestProfile: async (connectionId, profile, method, params) => {
+    if (activeRouteMockHandler) return activeRouteMockHandler(method, params, { connectionId, profile })
+    return {}
+  },
   profileRoutes: undefined,
-  openSession: async () => {},
+  openSession: async (sessionId, options) => {
+    host.lastOpenedSession = { sessionId, options }
+  },
   ensureAgent: undefined,
-  navigate: () => {},
-  notify: () => {},
-  notifyError: () => {}
+  navigate: (path) => {
+    host.lastNavigated = path
+  },
+  notify: (notification) => {
+    host.lastNotification = notification
+  },
+  notifyError: (err, title) => {
+    host.lastNotificationError = { err, title }
+  }
+}
+
+let activeRouteMockHandler = null
+export function setRouteMockHandler(handler) {
+  activeRouteMockHandler = handler
+}
+export function resetRouteMocks() {
+  activeRouteMockHandler = null
+  delete host.lastOpenedSession
+  delete host.lastNavigated
+  delete host.lastNotification
+  delete host.lastNotificationError
 }
 export const icons = {}
 export const queryClient = { invalidateQueries: async () => {} }
