@@ -51,6 +51,13 @@ export {
   TagFilterBar,
   TagPill,
   WhereDialog,
+  SessionRow,
+  ProjectCard,
+  NavigatorShell,
+  whereStateAtom,
+  whereOpenAtom,
+  openWhereDialog,
+  closeWhereDialog,
   activeRouteFrom,
   addSessionTag,
   createSessionInProject,
@@ -376,6 +383,26 @@ const PROJECT_SESSION_LIMIT = 2000
 const viewAtom = atom('projects')
 const queryAtom = atom('')
 const browseStateAtom = atom({ manual: false, selected: null, unavailable: null })
+
+// WhereDialog state atom: { open: boolean, route: any }
+const whereStateAtom = atom({ open: false, route: null })
+
+// Derived whereOpenAtom convenience
+const whereOpenAtom = {
+  get: () => Boolean(whereStateAtom.get()?.open),
+  set: (val) => {
+    const cur = whereStateAtom.get() || { open: false, route: null }
+    whereStateAtom.set({ ...cur, open: Boolean(val) })
+  }
+}
+
+function openWhereDialog(route = null) {
+  whereStateAtom.set({ open: true, route: route ?? null })
+}
+
+function closeWhereDialog() {
+  whereStateAtom.set({ open: false, route: null })
+}
 
 function readAtom(value) {
   return value && typeof value.get === 'function' ? value.get() : value
@@ -1559,7 +1586,7 @@ function SessionRow({ session, focused, project, allProjects, route }) {
               }),
               // Separator 1
               jsx(ContextMenuSeparator, {}),
-              // New session in this project (if within project)
+              // Fast-path: New session in this project (if within project)
               (project && !project.isNoProject) ? jsxs(ContextMenuItem, {
                 onSelect: () => void createSessionInProject(project, route),
                 children: [
@@ -1567,6 +1594,14 @@ function SessionRow({ session, focused, project, allProjects, route }) {
                   jsx('span', { children: `New session in ${project.label || project.name || project.id}` })
                 ]
               }) : null,
+              // Chooser-path: New session (choose location)… (always available)
+              jsxs(ContextMenuItem, {
+                onSelect: () => openWhereDialog(route),
+                children: [
+                  jsx(Codicon, { name: 'add', size: '0.875rem' }),
+                  jsx('span', { children: 'New session (choose location)…' })
+                ]
+              }),
               // 7. Branch
               jsxs(ContextMenuItem, {
                 onSelect: () => void branchSession(session, route),
@@ -1889,11 +1924,20 @@ function ProjectCard({ project, allProjects, currentId, filterQuery, route }) {
           jsxs(ContextMenuContent, {
             className: 'w-48',
             children: [
+              // Fast-path: New session in this project
               jsxs(ContextMenuItem, {
                 onSelect: () => void createSessionInProject(project, route),
                 children: [
                   jsx(Codicon, { name: 'add', size: '0.875rem' }),
                   jsx('span', { children: `New session in ${projectLabel}` })
+                ]
+              }),
+              // Chooser-path: New session (choose location)…
+              jsxs(ContextMenuItem, {
+                onSelect: () => openWhereDialog(route),
+                children: [
+                  jsx(Codicon, { name: 'add', size: '0.875rem' }),
+                  jsx('span', { children: 'New session (choose location)…' })
                 ]
               }),
               !project.isNoProject ? jsxs(ContextMenuItem, {
@@ -2116,7 +2160,8 @@ function NavigatorShell() {
   const catalog = useRouteCatalog(connectionId, profile)
   const activeRoute = activeRouteFrom(catalog.routes, connectionId, profile)
   const selectedRoute = browse.selected || (!browse.manual ? activeRoute : null)
-  const [whereOpen, setWhereOpen] = useState(false)
+  const whereState = useValue(whereStateAtom)
+  const whereOpen = Boolean(whereState?.open)
 
   // Query projects for WhereDialog when route is selected
   const projectsQuery = useQuery({
@@ -2162,7 +2207,7 @@ function NavigatorShell() {
                     className: chipBtn,
                     disabled: !selectedRoute,
                     title: 'New session (choose location)',
-                    onClick: () => setWhereOpen(true),
+                    onClick: () => openWhereDialog(selectedRoute),
                     children: jsx(Codicon, { name: 'add', size: '0.875rem' })
                   }),
                   jsx('button', {
@@ -2188,17 +2233,49 @@ function NavigatorShell() {
       }),
       jsx(WhereDialog, {
         open: whereOpen,
-        onOpenChange: setWhereOpen,
+        onOpenChange: (val) => {
+          if (!val) closeWhereDialog()
+          else openWhereDialog(selectedRoute)
+        },
         projects: availableProjects,
-        route: selectedRoute
+        route: whereState?.route || selectedRoute
       }),
-      jsx('div', {
-        className: 'min-h-0 flex flex-1 flex-col overflow-hidden',
-        children: selectedRoute
-          ? (view === 'projects'
-              ? jsx(ProjectBrowser, { route: selectedRoute }, routeKey(selectedRoute))
-              : jsx(SessionBrowser, { route: selectedRoute }, routeKey(selectedRoute)))
-          : jsx('div', { className: `${hintStyle} p-3`, children: catalog.error || 'Choose a profile to browse.' })
+      jsxs(ContextMenu, {
+        children: [
+          jsx(ContextMenuTrigger, {
+            asChild: true,
+            children: jsx('div', {
+              className: 'min-h-0 flex flex-1 flex-col overflow-hidden',
+              children: selectedRoute
+                ? (view === 'projects'
+                    ? jsx(ProjectBrowser, { route: selectedRoute }, routeKey(selectedRoute))
+                    : jsx(SessionBrowser, { route: selectedRoute }, routeKey(selectedRoute)))
+                : jsx('div', { className: `${hintStyle} p-3`, children: catalog.error || 'Choose a profile to browse.' })
+            })
+          }),
+          jsxs(ContextMenuContent, {
+            className: 'w-48',
+            children: [
+              jsxs(ContextMenuItem, {
+                disabled: !selectedRoute,
+                onSelect: () => selectedRoute && openWhereDialog(selectedRoute),
+                children: [
+                  jsx(Codicon, { name: 'add', size: '0.875rem' }),
+                  jsx('span', { children: 'New session (choose location)…' })
+                ]
+              }),
+              jsx(ContextMenuSeparator, {}),
+              jsxs(ContextMenuItem, {
+                disabled: !selectedRoute,
+                onSelect: () => selectedRoute && invalidateRoute(selectedRoute),
+                children: [
+                  jsx(Codicon, { name: 'refresh', size: '0.875rem' }),
+                  jsx('span', { children: 'Refresh' })
+                ]
+              })
+            ]
+          })
+        ]
       })
     ]
   })
