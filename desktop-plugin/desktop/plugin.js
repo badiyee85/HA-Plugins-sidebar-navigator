@@ -61,6 +61,7 @@ export {
   activeRouteFrom,
   addSessionTag,
   createSessionInProject,
+  describeBrowseError,
   duplicateProfileNames,
   focusedOnRoute,
   getAllRouteTags,
@@ -212,6 +213,20 @@ function routeLabel(route, duplicates = new Set()) {
   return duplicates.has(normalized.profile)
     ? `${normalized.profile} · ${normalized.connectionId}`
     : normalized.profile
+}
+
+const BROWSE_ERROR_MAX_CHARS = 240
+
+// Turn a failed profile read into one honest, actionable sidebar line. The
+// backend already explains itself (e.g. a profile whose session store has not
+// been reconciled yet); a generic "unavailable" hides the fix.
+function describeBrowseError(error, route, what = 'sessions') {
+  const reason = text(
+    typeof error === 'string' ? error : error?.message || error?.detail
+  ).slice(0, BROWSE_ERROR_MAX_CHARS)
+  const profile = text(normalizeRoute(route)?.profile)
+  const subject = profile ? `${what} for profile “${profile}”` : what
+  return reason ? `Couldn’t load ${subject}: ${reason}` : `Couldn’t load ${subject}. Try refresh.`
 }
 
 function queryKey(resource, route, extra = []) {
@@ -1775,7 +1790,7 @@ function SessionBrowser({ route }) {
         children: listQuery.status === 'pending'
           ? 'Loading sessions…'
           : listQuery.status === 'error'
-            ? 'Failed to retrieve session list.'
+            ? describeBrowseError(listQuery.error, route, 'sessions')
             : `${filtered.length} session${filtered.length === 1 ? '' : 's'}`
       }),
       jsx('div', {
@@ -2013,7 +2028,11 @@ function ProjectBrowser({ route }) {
   }
 
   if (treeQuery.status === 'error') {
-    return jsx('div', { className: `${hintStyle} p-3`, children: 'Projects are unavailable on this backend.' })
+    return jsx('div', {
+      className: `${hintStyle} p-3`,
+      role: 'alert',
+      children: describeBrowseError(treeQuery.error, route, 'projects')
+    })
   }
 
   const projects = [...(treeQuery.data?.projects ?? [])]
