@@ -31,6 +31,7 @@ In Hermes Desktop, the default sidebar project view limits previews to **3 sessi
 - **Session menu:** New window, Rename, Pin, Mark unread, Appearance (colour), Copy ID, Tags, Branch, Export (JSON), Move to project, Archive, Delete.
 - **Where chooser (v0.7):** *New session (choose location)…* on sessions, project cards, and the Navigator background opens a dialog to start a session in Home or any project, with a project filter.
 - **Project menu:** New session, Open Cockpit, Copy path.
+- **Bulk actions (v0.8):** Click the checklist button in the header to enter select mode, tick sessions (or a whole project / the whole Timeline with the header checkbox), then **Tag…**, **Move…**, **Archive**, or **Delete** them in one go. Selection is scoped to one profile at a time. Sessions with a turn in flight are skipped, delete asks first, and anything that fails stays selected so you can retry.
 
 ---
 
@@ -48,6 +49,8 @@ Projects are listed with their folder badges, session counts, and expandable con
 Use the search bar to filter across all projects simultaneously, click tags in the tag bar to narrow further, or toggle **Timeline** to see every conversation newest-first.
 
 ### 4. Act on Sessions
+Select several at once with the checklist button for bulk tag, move, archive, or delete.
+
 Right-click any session, project, or the empty Navigator background for the full action menu (rename, branch, export, move, archive, delete, new session in a chosen location).
 
 ---

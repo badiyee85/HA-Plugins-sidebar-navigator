@@ -54,12 +54,28 @@ export {
   SessionRow,
   ProjectCard,
   NavigatorShell,
+  BulkBar,
+  BulkTagDialog,
+  SelectBox,
   whereStateAtom,
   whereOpenAtom,
   openWhereDialog,
   closeWhereDialog,
   activeRouteFrom,
   addSessionTag,
+  addToSelection,
+  BULK_ACTIONS,
+  focusAtom,
+  bulkMutate,
+  bulkTag,
+  partitionBusy,
+  removeFromSelection,
+  runBulk,
+  selectionAtom,
+  selectionFor,
+  summarizeBulk,
+  summarizeTag,
+  toggleSelection,
   createSessionInProject,
   describeBrowseError,
   duplicateProfileNames,
@@ -1151,6 +1167,367 @@ async function openSessionInNewWindow(sessionId, route) {
   await openSessionSafely(route, sessionId, 'window')
 }
 
+// ── Bulk Selection & Actions ─────────────────────────────────────────────────
+//
+// Selection is scoped to ONE profile route at a time: ids are stored with the
+// routeKey they were picked under, so a selection can never leak into another
+// profile's list and every bulk request goes to the route that owns the ids.
+
+const EMPTY_SELECTION = { active: false, routeKey: '', ids: [] }
+const selectionAtom = atom(EMPTY_SELECTION)
+
+function selectionFor(state, route) {
+  const key = route ? routeKey(route) : ''
+  return key && state?.routeKey === key ? state.ids : []
+}
+
+function toggleSelection(state, route, sessionId) {
+  const key = routeKey(route)
+  if (!key || !sessionId) return state || EMPTY_SELECTION
+  const base = selectionFor(state, route)
+  const ids = base.includes(sessionId) ? base.filter(id => id !== sessionId) : [...base, sessionId]
+  return { active: true, routeKey: key, ids }
+}
+
+function addToSelection(state, route, sessionIds) {
+  const key = routeKey(route)
+  if (!key) return state || EMPTY_SELECTION
+  const ids = [...selectionFor(state, route)]
+  for (const id of sessionIds || []) if (id && !ids.includes(id)) ids.push(id)
+  return { active: true, routeKey: key, ids }
+}
+
+function removeFromSelection(state, route, sessionIds) {
+  const key = routeKey(route)
+  if (!key) return state || EMPTY_SELECTION
+  const drop = new Set(sessionIds || [])
+  return {
+    active: Boolean(state?.active),
+    routeKey: key,
+    ids: selectionFor(state, route).filter(id => !drop.has(id))
+  }
+}
+
+function setSelectMode(on) {
+  selectionAtom.set(on ? { active: true, routeKey: '', ids: [] } : EMPTY_SELECTION)
+}
+
+function toggleSessionSelected(route, sessionId) {
+  selectionAtom.set(toggleSelection(selectionAtom.get(), route, sessionId))
+}
+
+function selectSessions(route, sessionIds) {
+  selectionAtom.set(addToSelection(selectionAtom.get(), route, sessionIds))
+}
+
+function deselectSessions(route, sessionIds) {
+  selectionAtom.set(removeFromSelection(selectionAtom.get(), route, sessionIds))
+}
+
+// Sequential on purpose: one bad session must not abort the rest, and the
+// backend is not hammered with a burst of parallel destructive calls.
+async function runBulk(ids, worker) {
+  const done = []
+  const failed = []
+  for (const id of ids) {
+    try {
+      await worker(id)
+      done.push(id)
+    } catch (error) {
+      failed.push({ id, error })
+    }
+  }
+  return { done, failed }
+}
+
+// A session with a turn in flight must not be archived, deleted or moved out
+// from under the agent. Only the local route can see busy state; remote routes
+// are passed through unchanged.
+function partitionBusy(ids, route) {
+  if (!isLocalRoute(route)) return { runnable: [...ids], skipped: [] }
+  const busy = readAtom(host?.state?.busyBySession) || {}
+  const runnable = []
+  const skipped = []
+  for (const id of ids) (busy[id] ? skipped : runnable).push(id)
+  return { runnable, skipped }
+}
+
+const BULK_ACTIONS = {
+  archive: {
+    verb: 'Archived',
+    build: id => ['session.set_hidden', { session_id: id, hidden: true }]
+  },
+  delete: {
+    verb: 'Deleted',
+    build: id => ['session.delete', { session_id: id }]
+  },
+  move: {
+    verb: 'Moved',
+    build: (id, { cwd }) => ['session.workspace.move', { session_key: id, cwd }]
+  }
+}
+
+function summarizeBulk(verb, { done = [], failed = [], skipped = [] } = {}) {
+  const parts = []
+  if (done.length) parts.push(`${verb} ${done.length} session${done.length === 1 ? '' : 's'}`)
+  if (failed.length) {
+    const reason = String(failed[0]?.error?.message || '').slice(0, 80)
+    parts.push(`${failed.length} failed${reason ? ` (${reason})` : ''}`)
+  }
+  if (skipped.length) parts.push(`${skipped.length} skipped (running)`)
+  if (!parts.length) parts.push('No sessions selected')
+  return { kind: failed.length ? 'error' : done.length ? 'success' : 'info', message: parts.join(' · ') }
+}
+
+async function bulkMutate(action, ids, route, options = {}) {
+  const spec = BULK_ACTIONS[action]
+  if (!spec) throw new Error(`Unknown bulk action: ${action}`)
+  const { runnable, skipped } = partitionBusy(ids, route)
+
+  // Resolve the route fresh once; the rest of the batch reuses the cached catalog.
+  clearRouteCatalogCache()
+  let first = true
+  const result = await runBulk(runnable, async id => {
+    const [method, params] = spec.build(id, options)
+    const fresh = first
+    first = false
+    return requestForRoute(route, method, params, host, undefined, { fresh })
+  })
+
+  invalidateRoute(route)
+  deselectSessions(route, result.done)
+  const outcome = { action, ...result, skipped }
+  host.notify(summarizeBulk(spec.verb, outcome))
+
+  if (action === 'delete' && result.done.length) {
+    const owner = focusedOwner()
+    const focusedId = focusAtom.get()
+    if (result.done.some(id => focusedOnRoute(owner, route, focusedId, id))) host.navigate('/')
+  }
+  return outcome
+}
+
+// Tags are local storage, so the whole batch is one read-modify-write.
+function bulkTag(ids, route, tag, mode = 'add') {
+  const n = normalizeTag(tag)
+  const result = { changed: 0, unchanged: 0, full: 0 }
+  if (!n) return result
+  const map = readSessionTagsMap(route)
+  for (const id of ids) {
+    const cur = map[id] || []
+    if (mode === 'add') {
+      if (cur.includes(n)) result.unchanged += 1
+      else if (cur.length >= TAGS_PER_SESSION_MAX) result.full += 1
+      else {
+        map[id] = [...cur, n]
+        result.changed += 1
+      }
+    } else if (!cur.includes(n)) {
+      result.unchanged += 1
+    } else {
+      const next = cur.filter(t => t !== n)
+      if (next.length) map[id] = next
+      else delete map[id]
+      result.changed += 1
+    }
+  }
+  if (result.changed) writeSessionTagsMap(route, map)
+  return result
+}
+
+function summarizeTag(tag, mode, { changed = 0, unchanged = 0, full = 0 } = {}) {
+  const n = normalizeTag(tag)
+  const parts = []
+  if (changed) parts.push(`${mode === 'add' ? 'Tagged' : 'Untagged'} ${changed} session${changed === 1 ? '' : 's'} #${n}`)
+  if (unchanged) parts.push(`${unchanged} unchanged`)
+  if (full) parts.push(`${full} at the ${TAGS_PER_SESSION_MAX}-tag limit`)
+  if (!parts.length) parts.push('Nothing to change')
+  return { kind: full && !changed ? 'error' : changed ? 'success' : 'info', message: parts.join(' · ') }
+}
+
+const bulkBtn =
+  'inline-flex h-6 shrink-0 items-center gap-1 rounded-md border border-(--ui-stroke-secondary) px-2 ' +
+  'text-[0.6875rem] font-medium text-(--ui-text-secondary) transition-colors ' +
+  'hover:bg-(--chrome-action-hover) hover:text-(--ui-text-primary) disabled:cursor-not-allowed disabled:opacity-40'
+
+function SelectBox({ checked = false, indeterminate = false, onToggle, label }) {
+  const on = checked || indeterminate
+  return jsx('span', {
+    role: 'checkbox',
+    'aria-checked': indeterminate && !checked ? 'mixed' : Boolean(checked),
+    'aria-label': label,
+    tabIndex: 0,
+    className:
+      'inline-flex h-3.5 w-3.5 shrink-0 items-center justify-center rounded-[3px] border transition-colors ' +
+      (on
+        ? 'border-(--ui-accent) bg-(--ui-accent) text-(--ui-bg-primary)'
+        : 'border-(--ui-stroke-secondary) hover:border-(--ui-accent)'),
+    onClick: (e) => {
+      e.stopPropagation()
+      onToggle()
+    },
+    onKeyDown: (e) => {
+      if (e.key === ' ' || e.key === 'Enter') {
+        e.preventDefault()
+        e.stopPropagation()
+        onToggle()
+      }
+    },
+    children: on ? jsx(Codicon, { name: checked ? 'check' : 'dash', size: '0.625rem' }) : null
+  })
+}
+
+function BulkTagDialog({ open, onOpenChange, ids = [], route }) {
+  useValue(tagsRevisionAtom)
+  const [inputVal, setInputVal] = useState('')
+  const available = getAllRouteTags(route)
+  const tag = normalizeTag(inputVal)
+
+  const apply = (mode) => {
+    if (!tag) return
+    host.notify(summarizeTag(tag, mode, bulkTag(ids, route, tag, mode)))
+    setInputVal('')
+    onOpenChange(false)
+  }
+
+  return jsx(Dialog, {
+    open,
+    onOpenChange: (val) => {
+      onOpenChange(val)
+      if (!val) setInputVal('')
+    },
+    children: jsxs(DialogContent, {
+      className: 'max-w-sm p-4',
+      children: [
+        jsxs(DialogHeader, {
+          children: [
+            jsx(DialogTitle, { children: 'Tag selected sessions' }),
+            jsx('p', {
+              className: 'text-xs text-(--ui-text-quaternary) mt-0.5',
+              children: `${ids.length} session${ids.length === 1 ? '' : 's'} selected`
+            })
+          ]
+        }),
+        jsx(Input, {
+          autoFocus: true,
+          placeholder: 'Tag name…',
+          value: inputVal,
+          onChange: (e) => setInputVal(e.target.value),
+          onKeyDown: (e) => {
+            if (e.key === 'Enter') apply('add')
+          },
+          className: 'mt-2 w-full text-xs'
+        }),
+        available.length > 0 ? jsx('div', {
+          className: 'mt-2 flex max-h-24 flex-wrap gap-1 overflow-y-auto',
+          children: available.map(t => jsx('button', {
+            type: 'button',
+            key: t,
+            onClick: () => setInputVal(t),
+            className: 'rounded border border-(--ui-stroke-secondary) px-1.5 py-0.5 text-xs text-(--ui-text-secondary) hover:text-(--ui-text-primary) hover:bg-(--chrome-action-hover) transition-colors',
+            children: `#${t}`
+          }))
+        }) : null,
+        jsxs(DialogFooter, {
+          className: 'mt-3 pt-2 border-t border-(--ui-stroke-secondary) flex justify-end gap-1.5',
+          children: [
+            jsx(Button, { type: 'button', variant: 'ghost', onClick: () => onOpenChange(false), children: 'Cancel' }),
+            jsx(Button, { type: 'button', variant: 'ghost', disabled: !tag, onClick: () => apply('remove'), children: 'Remove tag' }),
+            jsx(Button, { type: 'button', disabled: !tag, onClick: () => apply('add'), children: 'Add tag' })
+          ]
+        })
+      ]
+    })
+  })
+}
+
+function BulkBar({ route }) {
+  const selection = useValue(selectionAtom)
+  const ids = selectionFor(selection, route)
+  const count = ids.length
+  const [working, setWorking] = useState(false)
+  const [deleteOpen, setDeleteOpen] = useState(false)
+  const [tagOpen, setTagOpen] = useState(false)
+  const [moveOpen, setMoveOpen] = useState(false)
+
+  const treeQuery = useQuery({
+    queryKey: queryKey('projects-tree', route),
+    queryFn: () => requestForRoute(route, 'projects.tree', { preview_limit: TREE_PREVIEW_LIMIT }),
+    enabled: Boolean(route) && moveOpen,
+    staleTime: 8000
+  })
+  const movableProjects = (treeQuery.data?.projects || []).filter(p => !p.isNoProject && resolveProjectCwd(p))
+
+  const run = async (fn) => {
+    setWorking(true)
+    try {
+      await fn()
+    } catch (err) {
+      host.notifyError?.(err, 'Bulk action failed')
+    } finally {
+      setWorking(false)
+    }
+  }
+
+  const idle = count === 0 || working
+  return jsxs('div', {
+    className: 'flex flex-wrap items-center gap-1.5 border-b border-(--ui-stroke-secondary) bg-(--ui-bg-subtle) px-2.5 py-1.5',
+    role: 'toolbar',
+    'aria-label': 'Bulk session actions',
+    children: [
+      jsx('span', {
+        className: 'mr-auto text-[0.75rem] font-medium text-(--ui-text-primary) tabular-nums',
+        children: count ? `${count} selected` : 'Select sessions'
+      }),
+      jsxs('button', {
+        type: 'button', className: bulkBtn, disabled: idle, title: 'Add or remove a tag on the selected sessions',
+        onClick: () => setTagOpen(true),
+        children: [jsx(Codicon, { name: 'tag', size: '0.75rem' }), jsx('span', { children: 'Tag…' })]
+      }),
+      jsxs('button', {
+        type: 'button', className: bulkBtn, disabled: idle, title: 'Move the selected sessions to a project',
+        onClick: () => setMoveOpen(true),
+        children: [jsx(Codicon, { name: 'folder', size: '0.75rem' }), jsx('span', { children: 'Move…' })]
+      }),
+      jsxs('button', {
+        type: 'button', className: bulkBtn, disabled: idle, title: 'Archive the selected sessions',
+        onClick: () => void run(() => bulkMutate('archive', ids, route)),
+        children: [jsx(Codicon, { name: 'archive', size: '0.75rem' }), jsx('span', { children: 'Archive' })]
+      }),
+      jsxs('button', {
+        type: 'button', className: bulkBtn, disabled: idle, title: 'Delete the selected sessions',
+        onClick: () => setDeleteOpen(true),
+        children: [jsx(Codicon, { name: 'trash', size: '0.75rem' }), jsx('span', { children: 'Delete' })]
+      }),
+      jsx('button', {
+        type: 'button', className: bulkBtn, disabled: count === 0 || working, title: 'Clear the selection',
+        onClick: () => deselectSessions(route, ids),
+        children: 'Clear'
+      }),
+      jsx(ConfirmDialog, {
+        open: deleteOpen,
+        onClose: () => setDeleteOpen(false),
+        title: `Delete ${count} session${count === 1 ? '' : 's'}`,
+        description: `Delete the ${count} selected session${count === 1 ? '' : 's'}? Sessions that are currently running are skipped. This action cannot be undone.`,
+        confirmLabel: 'Delete',
+        destructive: true,
+        onConfirm: () => run(() => bulkMutate('delete', ids, route))
+      }),
+      jsx(BulkTagDialog, { open: tagOpen, onOpenChange: setTagOpen, ids, route }),
+      jsx(WhereDialog, {
+        open: moveOpen,
+        onOpenChange: setMoveOpen,
+        projects: movableProjects,
+        route,
+        title: 'Move sessions',
+        description: `Move ${count} selected session${count === 1 ? '' : 's'} to which project?`,
+        includeHome: false,
+        onPick: (project) => run(() => bulkMutate('move', ids, route, { cwd: resolveProjectCwd(project) }))
+      })
+    ]
+  })
+}
+
 // ── Project-Scoped Session Creation & "Where?" Dialog ────────────────────────
 
 function resolveProjectCwd(project) {
@@ -1181,7 +1558,16 @@ async function createSessionInProject(targetProject, route) {
   }
 }
 
-function WhereDialog({ open, onOpenChange, projects = [], route }) {
+function WhereDialog({
+  open,
+  onOpenChange,
+  projects = [],
+  route,
+  title = 'Start New Session',
+  description = 'Where would you like to create this session?',
+  includeHome = true,
+  onPick = null
+}) {
   const [filter, setFilter] = useState('')
   const q = filter.trim().toLowerCase()
 
@@ -1204,6 +1590,10 @@ function WhereDialog({ open, onOpenChange, projects = [], route }) {
   const handleSelect = async (target) => {
     onOpenChange(false)
     setFilter('')
+    if (onPick) {
+      await Promise.resolve(onPick(target)).catch(() => {})
+      return
+    }
     await createSessionInProject(target, route).catch(() => {})
   }
 
@@ -1218,10 +1608,10 @@ function WhereDialog({ open, onOpenChange, projects = [], route }) {
       children: [
         jsxs(DialogHeader, {
           children: [
-            jsx(DialogTitle, { children: 'Start New Session' }),
+            jsx(DialogTitle, { children: title }),
             jsx('p', {
               className: 'text-xs text-(--ui-text-quaternary) mt-0.5',
-              children: 'Where would you like to create this session?'
+              children: description
             })
           ]
         }),
@@ -1236,7 +1626,7 @@ function WhereDialog({ open, onOpenChange, projects = [], route }) {
           className: 'max-h-64 min-h-24 overflow-y-auto space-y-1 pr-1',
           children: [
             // Home (Always available at top unless filtered specifically out)
-            (!q || 'home'.includes(q)) ? jsx('button', {
+            (includeHome && (!q || 'home'.includes(q))) ? jsx('button', {
               type: 'button',
               className: 'flex w-full items-center gap-2 rounded px-2.5 py-1.5 text-left text-xs hover:bg-(--chrome-action-hover) transition-colors border border-transparent hover:border-(--ui-stroke-secondary)',
               onClick: () => void handleSelect(homeItem),
@@ -1279,7 +1669,7 @@ function WhereDialog({ open, onOpenChange, projects = [], route }) {
               })
             }),
 
-            (filteredProjects.length === 0 && (!q || !'home'.includes(q))) ? jsx('div', {
+            (filteredProjects.length === 0 && (!includeHome || !q || !'home'.includes(q))) ? jsx('div', {
               className: `${hintStyle} py-3 text-center`,
               children: 'No matching projects found'
             }) : null
@@ -1445,6 +1835,10 @@ function SessionRow({ session, focused, project, allProjects, route }) {
   const busyMap = useValue(host?.state?.busyBySession) || {}
   const isBusy = Boolean(isLocal && session.id && (busyMap[session.id] || (isCurrent && host?.state?.busy && useValue(host?.state?.busy))))
 
+  const selection = useValue(selectionAtom)
+  const selectMode = Boolean(selection?.active)
+  const selected = selectMode && selectionFor(selection, route).includes(session.id)
+
   const sessionProfile = resolveSessionProfile(session, route)
   const [tagDialogOpen, setTagDialogOpen] = useState(false)
   useValue(tagsRevisionAtom)
@@ -1452,11 +1846,20 @@ function SessionRow({ session, focused, project, allProjects, route }) {
 
   const rowButton = jsxs('button', {
     type: 'button',
-    className: isCurrent ? rowBtnActive : rowBtn,
-    onClick: () => void openSessionSafely(route, session.id),
+    className: (isCurrent ? rowBtnActive : rowBtn) + (selected ? ' bg-(--ui-accent)/10' : ''),
+    'aria-pressed': selectMode ? selected : undefined,
+    onClick: () => {
+      if (selectMode) toggleSessionSelected(route, session.id)
+      else void openSessionSafely(route, session.id)
+    },
     title: session.title || session.preview || session.id,
     children: [
       isBusy ? jsx('span', { 'aria-hidden': 'true', className: 'arc-border arc-row' }) : null,
+      selectMode ? jsx(SelectBox, {
+        checked: selected,
+        label: `Select ${session.title || session.preview || session.id}`,
+        onToggle: () => toggleSessionSelected(route, session.id)
+      }) : null,
       jsx(SessionStatusIndicator, { session, route, colorOverride }),
       shouldShowProfileBadge(sessionProfile) ? jsx(ProfileGlyph, { name: sessionProfile }) : null,
       jsx('span', {
@@ -1755,6 +2158,7 @@ function SessionBrowser({ route }) {
   const q = useValue(queryAtom).trim()
   const currentId = useValue(focusAtom)
   const tagsMap = readSessionTagsMap(route)
+  const selection = useValue(selectionAtom)
 
   const listQuery = useQuery({
     queryKey: queryKey('sessions', route),
@@ -1780,18 +2184,30 @@ function SessionBrowser({ route }) {
       return matchesSessionFilter(s, q, sTags)
     })
     .sort((a, b) => (b.started_at ?? 0) - (a.started_at ?? 0))
+  const selectedIds = new Set(selectionFor(selection, route))
+  const visibleSelectedCount = filtered.filter(s => selectedIds.has(s.id)).length
 
   return jsxs('div', {
     className: 'flex min-h-0 flex-1 flex-col overflow-hidden',
     children: [
       jsx(TagFilterBar, { route, className: 'px-2 pb-1 border-b border-(--ui-stroke-secondary)' }),
-      jsx('div', {
-        className: `${hintStyle} px-3 py-1`,
-        children: listQuery.status === 'pending'
-          ? 'Loading sessions…'
-          : listQuery.status === 'error'
-            ? describeBrowseError(listQuery.error, route, 'sessions')
-            : `${filtered.length} session${filtered.length === 1 ? '' : 's'}`
+      jsxs('div', {
+        className: `${hintStyle} flex items-center gap-2 px-3 py-1`,
+        children: [
+          selection?.active && filtered.length ? jsx(SelectBox, {
+            checked: visibleSelectedCount === filtered.length,
+            indeterminate: visibleSelectedCount > 0 && visibleSelectedCount < filtered.length,
+            label: 'Select all visible sessions',
+            onToggle: () => (visibleSelectedCount === filtered.length ? deselectSessions : selectSessions)(route, filtered.map(s => s.id))
+          }) : null,
+          jsx('span', {
+            children: listQuery.status === 'pending'
+              ? 'Loading sessions…'
+              : listQuery.status === 'error'
+                ? describeBrowseError(listQuery.error, route, 'sessions')
+                : `${filtered.length} session${filtered.length === 1 ? '' : 's'}`
+          })
+        ]
       }),
       jsx('div', {
         className: 'min-h-0 flex-1 overflow-y-auto px-1.5 pb-3',
@@ -1860,6 +2276,10 @@ function ProjectCard({ project, allProjects, currentId, filterQuery, route }) {
   const projectLabel = project.isNoProject ? 'Home' : (project.label || project.name || project.id)
   const projectCwd = resolveProjectCwd(project)
 
+  const selection = useValue(selectionAtom)
+  const selectedIds = new Set(selectionFor(selection, route))
+  const visibleSelectedCount = (sessions || []).filter(s => s?.id && selectedIds.has(s.id)).length
+
   const headerRow = jsxs('div', {
     className: 'flex w-full items-center gap-1.5 px-2 py-1 cursor-pointer select-none rounded hover:bg-(--chrome-action-hover)',
     onClick: () => setExpanded(!expanded),
@@ -1872,6 +2292,12 @@ function ProjectCard({ project, allProjects, currentId, filterQuery, route }) {
           glyph: expanded ? '▼' : '▶'
         })
       }),
+      selection?.active && sessions.length ? jsx(SelectBox, {
+        checked: visibleSelectedCount === sessions.length,
+        indeterminate: visibleSelectedCount > 0 && visibleSelectedCount < sessions.length,
+        label: `Select all sessions in ${projectLabel}`,
+        onToggle: () => (visibleSelectedCount === sessions.length ? deselectSessions : selectSessions)(route, sessions.map(s => s.id))
+      }) : null,
       project.color
         ? jsx('span', {
             className: 'h-2.5 w-2.5 shrink-0 rounded-full',
@@ -2181,6 +2607,8 @@ function NavigatorShell() {
   const selectedRoute = browse.selected || (!browse.manual ? activeRoute : null)
   const whereState = useValue(whereStateAtom)
   const whereOpen = Boolean(whereState?.open)
+  const selection = useValue(selectionAtom)
+  const selectMode = Boolean(selection?.active)
 
   // Query projects for WhereDialog when route is selected
   const projectsQuery = useQuery({
@@ -2223,6 +2651,15 @@ function NavigatorShell() {
                 children: [
                   jsx('button', {
                     type: 'button',
+                    className: chipBtn + (selectMode ? ' border-(--ui-accent) text-(--ui-accent)' : ''),
+                    disabled: !selectedRoute,
+                    'aria-pressed': selectMode,
+                    title: selectMode ? 'Exit select mode' : 'Select sessions for bulk actions',
+                    onClick: () => setSelectMode(!selectMode),
+                    children: jsx(Codicon, { name: 'checklist', size: '0.875rem' })
+                  }),
+                  jsx('button', {
+                    type: 'button',
                     className: chipBtn,
                     disabled: !selectedRoute,
                     title: 'New session (choose location)',
@@ -2250,6 +2687,7 @@ function NavigatorShell() {
           })
         ]
       }),
+      selectMode && selectedRoute ? jsx(BulkBar, { route: selectedRoute }, routeKey(selectedRoute)) : null,
       jsx(WhereDialog, {
         open: whereOpen,
         onOpenChange: (val) => {
