@@ -65,6 +65,14 @@ export {
   addSessionTag,
   addToSelection,
   BULK_ACTIONS,
+  ShowMoreButton,
+  SessionBrowser,
+  ProjectBrowser,
+  closeNavigatorPage,
+  fetchProjectList,
+  ROW_PAGE_SIZE,
+  invalidateTagsCache,
+  tagsMapFor,
   copyText,
   isActiveRoute,
   isSessionPinned,
@@ -419,6 +427,14 @@ async function openSessionForRoute(route, sessionId, intent = 'in-place', sessio
 const SESSIONS_LIMIT = 500
 const TREE_PREVIEW_LIMIT = 100
 const PROJECT_SESSION_LIMIT = 2000
+// Rows mounted at once in the Timeline / an expanded project; "Show more" adds a page.
+const ROW_PAGE_SIZE = 100
+// The project list some views need (Move menu, bulk move) never uses session previews.
+const PROJECT_LIST_PARAMS = { preview_limit: 1 }
+
+function fetchProjectList(route) {
+  return requestForRoute(route, 'projects.tree', PROJECT_LIST_PARAMS)
+}
 
 const viewAtom = atom('projects')
 const queryAtom = atom('')
@@ -459,6 +475,7 @@ function focusedOwner() {
 function invalidateRoute(route) {
   queryClient.invalidateQueries({ queryKey: queryKey('sessions', route) })
   queryClient.invalidateQueries({ queryKey: queryKey('projects-tree', route) })
+  queryClient.invalidateQueries({ queryKey: queryKey('projects-list', route) })
   queryClient.invalidateQueries({ queryKey: queryKey('project-sessions', route) })
 }
 
@@ -545,24 +562,52 @@ function createMemoryStorage() {
   }
 }
 
+// Wraps a storage with a read-through cache: a row asks for its pin / unread /
+// colour / tags on every render, and ctx.storage parses JSON on every get, so
+// 500 rows meant thousands of parses. Writes update the cache; clear() drops it
+// (another window changed the stored value).
+function withReadCache(storage) {
+  const cache = new Map()
+  return {
+    get(key, fallback) {
+      if (!cache.has(key)) cache.set(key, storage.get(key, null))
+      const value = cache.get(key)
+      return value === null || value === undefined ? fallback : value
+    },
+    set(key, value) {
+      storage.set(key, value)
+      cache.set(key, value)
+    },
+    remove(key) {
+      storage.remove(key)
+      cache.set(key, null)
+    },
+    clear() {
+      cache.clear()
+    }
+  }
+}
+
 // Replaced by ctx.storage in register(). The in-memory default keeps helpers
 // usable before registration and in tests.
-let pluginStorage = createMemoryStorage()
+let pluginStorage = withReadCache(createMemoryStorage())
 let pluginOs = null
 // Routes whose legacy localStorage tags were already looked for this session.
 const legacyTagsChecked = new Set()
 
 function setPluginContext(ctx) {
   if (ctx?.storage) {
-    pluginStorage = ctx.storage
+    pluginStorage = withReadCache(ctx.storage)
     legacyTagsChecked.clear()
+    tagsMapCache.clear()
   }
   pluginOs = ctx?.os ?? null
 }
 
 function setPluginStorage(storage) {
-  pluginStorage = storage || createMemoryStorage()
+  pluginStorage = withReadCache(storage || createMemoryStorage())
   legacyTagsChecked.clear()
+  tagsMapCache.clear()
 }
 
 // Is this route the profile the Desktop window is showing right now? Only then
@@ -603,7 +648,7 @@ function readIdList(route, base) {
   const key = storageKey(base, route)
   if (!key) return []
   const list = pluginStorage.get(key, [])
-  return Array.isArray(list) ? list.filter(id => typeof id === 'string') : []
+  return Array.isArray(list) ? list.filter(id => typeof id === 'string') : [] // filter() copies
 }
 
 function writeIdList(route, base, list) {
@@ -622,7 +667,7 @@ function isSessionPinned(sessionId, session, route) {
 function readColorMap(route) {
   const key = storageKey('colors', route)
   const map = key ? pluginStorage.get(key, {}) : {}
-  return map && typeof map === 'object' && !Array.isArray(map) ? map : {}
+  return map && typeof map === 'object' && !Array.isArray(map) ? { ...map } : {}
 }
 
 function getSessionColorOverride(sessionId, route) {
@@ -754,14 +799,38 @@ function migrateLegacyTags(route, key) {
   }
 }
 
-function readSessionTagsMap(route) {
+// Parsed + sanitised tags per route. Rows ask for their tags on every render, so
+// reading ctx.storage (a JSON.parse of the whole map) per row made a 500-row
+// Timeline quadratic. The cache is dropped on every write and whenever another
+// window changes the stored value; treat what tagsMapFor returns as read-only.
+const tagsMapCache = new Map()
+const NO_TAGS = Object.freeze({})
+
+function invalidateTagsCache() {
+  tagsMapCache.clear()
+  pluginStorage.clear()
+}
+
+function tagsMapFor(route) {
   const key = tagsKey(route)
-  if (!key) return {}
-  const stored = pluginStorage.get(key, null)
-  if (stored !== null) return cleanTagsMap(stored)
-  if (legacyTagsChecked.has(key)) return {}
-  legacyTagsChecked.add(key)
-  return migrateLegacyTags(route, key)
+  if (!key) return NO_TAGS
+  let map = tagsMapCache.get(key)
+  if (!map) {
+    const stored = pluginStorage.get(key, null)
+    if (stored !== null) map = cleanTagsMap(stored)
+    else if (legacyTagsChecked.has(key)) map = {}
+    else {
+      legacyTagsChecked.add(key)
+      map = migrateLegacyTags(route, key)
+    }
+    tagsMapCache.set(key, map)
+  }
+  return map
+}
+
+// A private copy for callers that edit the map before writing it back.
+function readSessionTagsMap(route) {
+  return { ...tagsMapFor(route) }
 }
 
 function writeSessionTagsMap(route, map) {
@@ -770,13 +839,13 @@ function writeSessionTagsMap(route, map) {
   const cleanMap = cleanTagsMap(map)
   if (Object.keys(cleanMap).length) pluginStorage.set(key, cleanMap)
   else pluginStorage.remove(key)
+  tagsMapCache.set(key, cleanMap)
   bumpTagsRevision()
 }
 
 function getSessionTags(sessionId, route) {
   if (!sessionId) return []
-  const map = readSessionTagsMap(route)
-  return map[sessionId] || []
+  return tagsMapFor(route)[sessionId] || []
 }
 
 function setSessionTags(sessionId, tags, route) {
@@ -821,7 +890,7 @@ function toggleSessionTag(sessionId, tag, route) {
 }
 
 function getAllRouteTags(route) {
-  const map = readSessionTagsMap(route)
+  const map = tagsMapFor(route)
   const s = new Set()
   for (const tags of Object.values(map)) {
     for (const t of tags) s.add(t)
@@ -992,8 +1061,8 @@ function TagDialog({ open, onOpenChange, session, route }) {
   useValue(tagsRevisionAtom)
   const [inputVal, setInputVal] = useState('')
   const sessionId = session?.id
-  const assignedTags = sessionId ? getSessionTags(sessionId, route) : []
-  const availableTags = getAllRouteTags(route)
+  const assignedTags = open && sessionId ? getSessionTags(sessionId, route) : []
+  const availableTags = open ? getAllRouteTags(route) : []
 
   const handleAdd = (tagToAdd) => {
     const n = normalizeTag(tagToAdd || inputVal)
@@ -1502,10 +1571,10 @@ function BulkBar({ route }) {
   const [moveOpen, setMoveOpen] = useState(false)
 
   const treeQuery = useQuery({
-    queryKey: queryKey('projects-tree', route),
-    queryFn: () => requestForRoute(route, 'projects.tree', { preview_limit: TREE_PREVIEW_LIMIT }),
+    queryKey: queryKey('projects-list', route),
+    queryFn: () => fetchProjectList(route),
     enabled: Boolean(route) && moveOpen,
-    staleTime: 8000
+    staleTime: 60000
   })
   const movableProjects = (treeQuery.data?.projects || []).filter(p => !p.isNoProject && resolveProjectCwd(p))
 
@@ -2125,8 +2194,8 @@ function SessionRow({ session, focused, project, allProjects, route }) {
           })
         ]
       }),
-      // Rename Dialog
-      jsx(Dialog, {
+      // Rename Dialog (mounted only while open: 500 idle dialogs per Timeline was costly)
+      renameOpen ? jsx(Dialog, {
         open: renameOpen,
         onOpenChange: setRenameOpen,
         children: jsxs(DialogContent, {
@@ -2169,9 +2238,9 @@ function SessionRow({ session, focused, project, allProjects, route }) {
             })
           ]
         })
-      }),
+      }) : null,
       // Delete Confirmation Dialog
-      jsx(ConfirmDialog, {
+      deleteOpen ? jsx(ConfirmDialog, {
         open: deleteOpen,
         onClose: () => setDeleteOpen(false),
         title: 'Delete session',
@@ -2179,25 +2248,37 @@ function SessionRow({ session, focused, project, allProjects, route }) {
         confirmLabel: 'Delete',
         destructive: true,
         onConfirm: () => deleteSession(session.id, route)
-      }),
+      }) : null,
       // Tag Management Dialog
-      jsx(TagDialog, {
+      tagDialogOpen ? jsx(TagDialog, {
         open: tagDialogOpen,
         onOpenChange: setTagDialogOpen,
         session,
         route
-      })
+      }) : null
     ]
   })
 }
 
 // ── Sessions Flattened View ──────────────────────────────────────────────────
 
+function ShowMoreButton({ total, shown, onMore }) {
+  if (total <= shown) return null
+  const next = Math.min(ROW_PAGE_SIZE, total - shown)
+  return jsx('button', {
+    type: 'button',
+    className: 'mt-1 w-full rounded py-1 text-center text-[0.6875rem] font-medium text-(--ui-accent) hover:bg-(--chrome-action-hover) transition-colors',
+    onClick: onMore,
+    children: `Show ${next} more (${total - shown} hidden)`
+  })
+}
+
 function SessionBrowser({ route }) {
+  const [shown, setShown] = useState(ROW_PAGE_SIZE)
   useValue(tagsRevisionAtom)
   const q = useValue(queryAtom).trim()
   const currentId = useValue(focusAtom)
-  const tagsMap = readSessionTagsMap(route)
+  const tagsMap = tagsMapFor(route)
   const selection = useValue(selectionAtom)
 
   const listQuery = useQuery({
@@ -2208,11 +2289,13 @@ function SessionBrowser({ route }) {
     staleTime: 5000
   })
 
+  // Only the project list is needed here (Move menu), so skip the session previews
+  // and keep it out of the Projects view's cache entry.
   const treeQuery = useQuery({
-    queryKey: queryKey('projects-tree', route),
-    queryFn: () => requestForRoute(route, 'projects.tree', { preview_limit: TREE_PREVIEW_LIMIT }),
+    queryKey: queryKey('projects-list', route),
+    queryFn: () => fetchProjectList(route),
     enabled: Boolean(route),
-    staleTime: 8000
+    staleTime: 60000
   })
 
   const allProjects = treeQuery.data?.projects || []
@@ -2251,9 +2334,12 @@ function SessionBrowser({ route }) {
       }),
       jsx('div', {
         className: 'min-h-0 flex-1 overflow-y-auto px-1.5 pb-3',
-        children: filtered.map((s) =>
-          jsx(SessionRow, { session: s, focused: s.id === currentId, allProjects, route }, rowKey(route, s.id))
-        )
+        children: [
+          ...filtered.slice(0, shown).map((s) =>
+            jsx(SessionRow, { session: s, focused: s.id === currentId, allProjects, route }, rowKey(route, s.id))
+          ),
+          jsx(ShowMoreButton, { total: filtered.length, shown, onMore: () => setShown(shown + ROW_PAGE_SIZE) }, '__more__')
+        ]
       })
     ]
   })
@@ -2277,6 +2363,7 @@ function extractSessionsFromProjectTree(project) {
 function ProjectCard({ project, allProjects, currentId, filterQuery, route }) {
   const [expanded, setExpanded] = useState(true)
   const [loadAll, setLoadAll] = useState(false)
+  const [shown, setShown] = useState(ROW_PAGE_SIZE)
 
   const preview = project.previewSessions ?? []
   const totalCount = Number(project.sessionCount ?? preview.length)
@@ -2296,7 +2383,7 @@ function ProjectCard({ project, allProjects, currentId, filterQuery, route }) {
     ? extractSessionsFromProjectTree(fullQuery.data?.project)
     : preview
 
-  const tagsMap = readSessionTagsMap(route)
+  const tagsMap = tagsMapFor(route)
 
   if (filterQuery) {
     sessions = sessions.filter((s) => {
@@ -2453,9 +2540,12 @@ function ProjectCard({ project, allProjects, currentId, filterQuery, route }) {
               ? jsx('div', { className: `${hintStyle} px-2 py-1`, children: 'Loading full history…' })
               : sessions.length === 0
                 ? jsx('div', { className: `${hintStyle} px-2 py-1`, children: 'No matching sessions' })
-                : sessions.map((s) =>
-                    jsx(SessionRow, { session: s, focused: s.id === currentId, project, allProjects, route }, `${project.id}/${rowKey(route, s.id)}`)
-                  )
+                : [
+                    ...sessions.slice(0, shown).map((s) =>
+                      jsx(SessionRow, { session: s, focused: s.id === currentId, project, allProjects, route }, `${project.id}/${rowKey(route, s.id)}`)
+                    ),
+                    jsx(ShowMoreButton, { total: sessions.length, shown, onMore: () => setShown(shown + ROW_PAGE_SIZE) }, '__more__')
+                  ]
           }),
           hasTruncated ? jsx('button', {
             type: 'button',
@@ -2629,7 +2719,21 @@ function ProfileSelector({ catalog, activeRoute }) {
   })
 }
 
-function NavigatorShell() {
+// The full page is a route with no chrome of its own, so give it a way out:
+// back to wherever the user came from, else home.
+function closeNavigatorPage() {
+  try {
+    if (typeof window !== 'undefined' && window.history?.length > 1) {
+      window.history.back()
+      return
+    }
+  } catch {
+    // fall through to home
+  }
+  host.navigate('/')
+}
+
+function NavigatorShell({ onClose } = {}) {
   const view = useValue(viewAtom)
   const q = useValue(queryAtom)
   const profile = useValue(host.state.profile)
@@ -2655,6 +2759,20 @@ function NavigatorShell() {
   return jsxs('div', {
     className: 'flex h-full min-h-0 flex-col bg-(--ui-bg-primary) text-(--ui-text-primary)',
     children: [
+      onClose ? jsxs('div', {
+        className: 'flex items-center justify-between gap-2 border-b border-(--ui-stroke-secondary) px-2.5 py-1.5',
+        children: [
+          jsx('span', { className: 'text-[0.8125rem] font-semibold text-(--ui-text-primary)', children: 'Navigator' }),
+          jsx('button', {
+            type: 'button',
+            className: chipBtn,
+            'aria-label': 'Close Navigator',
+            title: 'Close Navigator',
+            onClick: onClose,
+            children: jsx(Codicon, { name: 'close', size: '0.875rem' })
+          })
+        ]
+      }) : null,
       jsx(ProfileSelector, { catalog, activeRoute }),
       jsxs('div', {
         className: 'flex flex-col gap-2 border-b border-(--ui-stroke-secondary) p-2.5',
@@ -2782,6 +2900,17 @@ export default {
   register(ctx) {
     setPluginContext(ctx)
 
+    // Another Desktop window may change this plugin's stored state; drop the
+    // parsed-tags cache and repaint. (ctx.storage keys carry this prefix.)
+    if (typeof window !== 'undefined') {
+      ctx.addEventListener?.(window, 'storage', (event) => {
+        if (!event?.key || String(event.key).includes(`hermes.plugin.${ID}.`)) {
+          invalidateTagsCache()
+          bumpTagsRevision()
+        }
+      })
+    }
+
     // 1. Layout Pane: Can be docked on the left rail or stacked alongside sessions
     ctx.register({
       id: 'navigator-pane',
@@ -2797,7 +2926,7 @@ export default {
       id: 'navigator-page',
       area: ROUTES_AREA,
       data: { path: '/navigator' },
-      render: () => jsx(NavigatorShell, {})
+      render: () => jsx(NavigatorShell, { onClose: closeNavigatorPage })
     })
 
     // 3. Sidebar Nav Item: Quick navigation icon in the left toolbar

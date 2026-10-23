@@ -88,5 +88,9 @@ export function resetRouteMocks() {
 }
 export const icons = {}
 export const queryClient = { invalidateQueries: async () => {} }
-export const useQuery = () => ({ status: 'pending', data: null })
+let queryMock = null
+export function setQueryMock(handler) {
+  queryMock = handler
+}
+export const useQuery = options => (queryMock ? queryMock(options) : { status: 'pending', data: null })
 export const useValue = value => value?.get?.() ?? value

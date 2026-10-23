@@ -7,7 +7,7 @@
 - **Primary Lane:** `badiyee85`
 - **Target Surface:** Hermes Desktop App (`desktop-plugins/ha-sidebar-navigator/plugin.js`)
 
-## Features (v0.8.1)
+## Features (v0.8.2)
 - Complete project session lists without the 3-item truncation (up to 2,000 sessions per project).
 - Search across all projects and sessions (title, preview, ID).
 - Projects view and chronological Timeline view.
@@ -24,11 +24,17 @@
 - Real sidebar pin/colour changes go through `host.sessions.pin` / `host.sessions.setColor`, only when the route is the profile Desktop is showing. Unread has no public verb, so it stays Navigator-only.
 - Clipboard goes through `ctx.os.writeClipboard`, with `navigator.clipboard` as the fallback. Never `window.hermesDesktop.*`.
 
+## Performance notes (v0.8.2)
+- Rows ask for pins, colours, unread marks and tags on every render. `ctx.storage` parses JSON on every `get`, so reads go through a read-through cache (`withReadCache`) and parsed tag maps are cached per route (`tagsMapFor`, treat as read-only; `readSessionTagsMap` returns a private copy). Writes update the cache; a `storage` event from another window drops it. This took a 500-row Timeline with 400 tagged sessions from about 6 s of render work to about 15 ms.
+- Rename / delete / tag dialogs mount only while open. The Timeline and expanded projects mount `ROW_PAGE_SIZE` (100) rows with a *Show more* button.
+- The Timeline's project list (Move menu) uses `projects.tree` with `preview_limit: 1` under its own query key (`projects-list`), never the Projects view's `projects-tree` entry.
+- The full-page route has its own Close button (history back, else home). The docked pane relies on the app's pane chrome.
+
 ## Registration surfaces
 - Left-rail pane (`navigator-pane`), full page route `/navigator`, sidebar nav item, and command-palette action *Sidebar Navigator: Open All Projects & Sessions*.
 
 ## Tests
-- Run from repo root: `node --loader ./tests/loader.mjs --test tests/*.test.mjs` (83 tests, SDK stubbed).
+- Run from repo root: `node --loader ./tests/loader.mjs --test tests/*.test.mjs` (93 tests, SDK stubbed).
 
 ## Catalog pin
 - Authoritative pin lives upstream in `NousResearch/hermes-agent/plugin-catalog/ha-sidebar-navigator.yaml`. `plugin-catalog/ha-sidebar-navigator.yaml` here is a local reference copy and may lag the upstream pin.
