@@ -21,7 +21,7 @@ In Hermes Desktop, the default sidebar project view limits previews to **3 sessi
 
 **Find**
 - **Instant Search:** Live filter across titles, preview snippets, and session IDs as you type.
-- **Session Tags (v0.6):** Add up to 16 colour-coded tags per session (*Tags…* menu), then filter with the tag bar or `#tag` terms in the search box. Tags are stored locally per profile route.
+- **Session Tags (v0.6):** Add up to 16 colour-coded tags per session (*Tags…* menu), then filter with the tag bar or `#tag` terms in the search box. Tags, colours and unread marks live in the plugin's own storage (`ctx.storage`), per profile route. Tags saved by older builds are imported automatically the first time you open a profile.
 
 **See**
 - **Live Status (v0.4):** Status dots on session rows show live state for the active profile (other profiles show a neutral dot).
@@ -29,6 +29,7 @@ In Hermes Desktop, the default sidebar project view limits previews to **3 sessi
 
 **Act (right-click menus)**
 - **Session menu:** New window, Rename, Pin, Mark unread, Appearance (colour), Copy ID, Tags, Branch, Export (JSON), Move to project, Archive, Delete.
+  Pin and colour also update the real sidebar for the profile Desktop is currently showing (through `host.sessions`); for other profiles they are remembered by the Navigator only.
 - **Where chooser (v0.7):** *New session (choose location)…* on sessions, project cards, and the Navigator background opens a dialog to start a session in Home or any project, with a project filter.
 - **Project menu:** New session, Open Cockpit, Copy path.
 - **Bulk actions (v0.8):** Click the checklist button in the header to enter select mode, tick sessions (or a whole project / the whole Timeline with the header checkbox), then **Tag…**, **Move…**, **Archive**, or **Delete** them in one go. Selection is scoped to one profile at a time. Sessions with a turn in flight are skipped, delete asks first, and anything that fails stays selected so you can retry.

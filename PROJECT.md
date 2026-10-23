@@ -7,7 +7,7 @@
 - **Primary Lane:** `badiyee85`
 - **Target Surface:** Hermes Desktop App (`desktop-plugins/ha-sidebar-navigator/plugin.js`)
 
-## Features (v0.8.0)
+## Features (v0.8.1)
 - Complete project session lists without the 3-item truncation (up to 2,000 sessions per project).
 - Search across all projects and sessions (title, preview, ID).
 - Projects view and chronological Timeline view.
@@ -19,11 +19,16 @@
 - Bulk select mode (v0.8): multi-select across a project or the Timeline, then tag / move / archive / delete in one action. Per-profile scope, running sessions skipped, partial failures stay selected.
 - Session actions: rename, pin, unread, colour, copy ID, branch, export, move to project, archive, delete, open in new window.
 
+## Persistence & host boundaries (v0.8.1)
+- Navigator state (tags, pins, colours, unread) is stored only in `ctx.storage`, keyed per profile route. No raw `localStorage` writes and no synthetic `StorageEvent`s. The single remaining `localStorage` access is a one-time read-and-delete that imports tags saved by pre-0.8.1 builds.
+- Real sidebar pin/colour changes go through `host.sessions.pin` / `host.sessions.setColor`, only when the route is the profile Desktop is showing. Unread has no public verb, so it stays Navigator-only.
+- Clipboard goes through `ctx.os.writeClipboard`, with `navigator.clipboard` as the fallback. Never `window.hermesDesktop.*`.
+
 ## Registration surfaces
 - Left-rail pane (`navigator-pane`), full page route `/navigator`, sidebar nav item, and command-palette action *Sidebar Navigator: Open All Projects & Sessions*.
 
 ## Tests
-- Run from repo root: `node --loader ./tests/loader.mjs --test tests/*.test.mjs` (74 tests, SDK stubbed).
+- Run from repo root: `node --loader ./tests/loader.mjs --test tests/*.test.mjs` (83 tests, SDK stubbed).
 
 ## Catalog pin
 - Authoritative pin lives upstream in `NousResearch/hermes-agent/plugin-catalog/ha-sidebar-navigator.yaml`. `plugin-catalog/ha-sidebar-navigator.yaml` here is a local reference copy and may lag the upstream pin.

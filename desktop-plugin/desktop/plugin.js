@@ -65,6 +65,15 @@ export {
   addSessionTag,
   addToSelection,
   BULK_ACTIONS,
+  copyText,
+  isActiveRoute,
+  isSessionPinned,
+  getSessionColorOverride,
+  setSessionColorOverride,
+  setPluginContext,
+  setPluginStorage,
+  toggleSessionPin,
+  toggleSessionUnread,
   focusAtom,
   bulkMutate,
   bulkTag,
@@ -522,89 +531,139 @@ function IconOr({ icon, glyph }) {
 
 // ── Session Context Menu Actions & Storage Helpers ──────────────────────────
 
-function isSessionPinned(sessionId, session, route) {
-  if (session?.pinned === true) return true
-  return readIdList(storageKey('hermes.desktop.pinnedSessions', route)).includes(sessionId)
-}
+// Navigator state (pins, colours, unread marks, tags) lives in the plugin's own
+// namespaced store, ctx.storage, and nowhere else. The real sidebar's pin and
+// colour are only ever changed through the public host.sessions verbs, and only
+// for the profile the Desktop window is actually showing.
 
-function getSessionColorOverride(sessionId, route) {
-  try {
-    const key = storageKey('hermes.desktop.sessionColors', route)
-    const raw = typeof window !== 'undefined' ? window.localStorage?.getItem(key) : null
-    if (raw) {
-      const map = JSON.parse(raw)
-      if (map && map[sessionId]) return map[sessionId]
-    }
-  } catch {}
-  return null
-}
-
-function setSessionColorOverride(sessionId, color, route) {
-  try {
-    const key = storageKey('hermes.desktop.sessionColors', route)
-    if (!key) return
-    const raw = typeof window !== 'undefined' ? window.localStorage?.getItem(key) : null
-    const map = raw ? JSON.parse(raw) || {} : {}
-    if (color) {
-      map[sessionId] = color
-    } else {
-      delete map[sessionId]
-    }
-    window.localStorage?.setItem(key, JSON.stringify(map))
-    window.dispatchEvent(new StorageEvent('storage', {
-      key,
-      newValue: JSON.stringify(map)
-    }))
-  } catch (err) {
-    console.warn('Failed to update session color override', err)
+function createMemoryStorage() {
+  const map = new Map()
+  return {
+    get: (key, fallback) => (map.has(key) ? JSON.parse(map.get(key)) : fallback),
+    set: (key, value) => { map.set(key, JSON.stringify(value)) },
+    remove: (key) => { map.delete(key) }
   }
 }
 
-// Hermes' public gateway RPC surface has no route-aware pin/read verbs. Keep
-// these presentation-only controls route-qualified rather than falling back to
-// a private REST bridge or an active-gateway request, which could mutate the
-// wrong source when duplicate session ids exist.
-function readIdList(key) {
-  if (!key || typeof window === 'undefined') return []
+// Replaced by ctx.storage in register(). The in-memory default keeps helpers
+// usable before registration and in tests.
+let pluginStorage = createMemoryStorage()
+let pluginOs = null
+// Routes whose legacy localStorage tags were already looked for this session.
+const legacyTagsChecked = new Set()
+
+function setPluginContext(ctx) {
+  if (ctx?.storage) {
+    pluginStorage = ctx.storage
+    legacyTagsChecked.clear()
+  }
+  pluginOs = ctx?.os ?? null
+}
+
+function setPluginStorage(storage) {
+  pluginStorage = storage || createMemoryStorage()
+  legacyTagsChecked.clear()
+}
+
+// Is this route the profile the Desktop window is showing right now? Only then
+// can host.sessions.* address its sidebar rows.
+function isActiveRoute(route) {
+  const normalized = normalizeRoute(route)
+  const owner = activeOwner()
+  if (!normalized || !owner) return false
+  if (isLegacyRoute(normalized)) return normalized.profile === text(owner.profile)
+  return normalized.connectionId === text(owner.connectionId) && normalized.profile === text(owner.profile)
+}
+
+async function copyText(value) {
   try {
-    const parsed = JSON.parse(window.localStorage?.getItem(key) || '[]')
-    return Array.isArray(parsed) ? parsed.filter(id => typeof id === 'string') : []
+    if (pluginOs?.writeClipboard && (await pluginOs.writeClipboard(value))) return true
   } catch {
-    return []
+    // fall through to the web clipboard
   }
+  try {
+    if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(value)
+      return true
+    }
+  } catch {
+    // reported by the caller
+  }
+  return false
 }
 
-function writeIdList(key, list) {
-  if (!key || typeof window === 'undefined') return false
-  const value = JSON.stringify(list)
-  window.localStorage?.setItem(key, value)
-  window.dispatchEvent(new StorageEvent('storage', { key, newValue: value }))
+async function copyWithToast(value, label) {
+  const ok = await copyText(value)
+  if (ok) host.notify({ kind: 'success', message: `${label} copied to clipboard` })
+  else host.notifyError?.(new Error('Clipboard is unavailable'), `Failed to copy ${label.toLowerCase()}`)
+  return ok
+}
+
+function readIdList(route, base) {
+  const key = storageKey(base, route)
+  if (!key) return []
+  const list = pluginStorage.get(key, [])
+  return Array.isArray(list) ? list.filter(id => typeof id === 'string') : []
+}
+
+function writeIdList(route, base, list) {
+  const key = storageKey(base, route)
+  if (!key) return false
+  if (list.length) pluginStorage.set(key, list)
+  else pluginStorage.remove(key)
   return true
 }
 
+function isSessionPinned(sessionId, session, route) {
+  if (session?.pinned === true) return true
+  return readIdList(route, 'pins').includes(sessionId)
+}
+
+function readColorMap(route) {
+  const key = storageKey('colors', route)
+  const map = key ? pluginStorage.get(key, {}) : {}
+  return map && typeof map === 'object' && !Array.isArray(map) ? map : {}
+}
+
+function getSessionColorOverride(sessionId, route) {
+  return readColorMap(route)[sessionId] || null
+}
+
+function setSessionColorOverride(sessionId, color, route) {
+  const key = storageKey('colors', route)
+  if (!key) return
+  const map = readColorMap(route)
+  if (color) map[sessionId] = color
+  else delete map[sessionId]
+  if (Object.keys(map).length) pluginStorage.set(key, map)
+  else pluginStorage.remove(key)
+  if (isActiveRoute(route)) host.sessions?.setColor?.(sessionId, color || null)
+}
+
 async function toggleSessionPin(sessionId, currentlyPinned, route) {
-  const key = storageKey('hermes.desktop.pinnedSessions', route)
-  const list = readIdList(key)
+  const list = readIdList(route, 'pins')
   const next = currentlyPinned
     ? list.filter(id => id !== sessionId)
     : [sessionId, ...list.filter(id => id !== sessionId)]
-  if (!writeIdList(key, next)) throw new Error('Pinned session storage is unavailable.')
+  if (!writeIdList(route, 'pins', next)) throw new Error('Navigator storage is unavailable.')
+  if (isActiveRoute(route)) host.sessions?.pin?.(sessionId, !currentlyPinned)
   return !currentlyPinned
 }
 
 async function toggleSessionUnread(sessionId, currentlyUnread, route) {
-  const key = storageKey('hermes.desktop.unreadSessions', route)
-  const list = readIdList(key)
+  const list = readIdList(route, 'unread')
   const next = currentlyUnread
     ? list.filter(id => id !== sessionId)
     : [sessionId, ...list.filter(id => id !== sessionId)]
-  if (!writeIdList(key, next)) throw new Error('Unread session storage is unavailable.')
+  if (!writeIdList(route, 'unread', next)) throw new Error('Navigator storage is unavailable.')
   return !currentlyUnread
 }
 
 // ─── Session Tags Storage & Utilities ────────────────────────────────────────
 
-const TAGS_STORAGE_BASE = 'hermes.desktop.sessionTags'
+const TAGS_STORAGE_BASE = 'sessionTags'
+// Pre-0.8.1 builds kept tags in the page's localStorage; read once, then removed.
+const LEGACY_TAGS_STORAGE_BASE = 'hermes.desktop.sessionTags'
 const TAG_MAX_LEN = 32
 const TAGS_PER_SESSION_MAX = 16
 
@@ -667,51 +726,50 @@ function sanitizeTagList(list) {
   return out
 }
 
-function readSessionTagsMap(route) {
-  const key = tagsKey(route)
-  if (!key) return {}
-  try {
-    const raw = typeof window !== 'undefined' && window.localStorage
-      ? window.localStorage.getItem(key)
-      : (typeof globalThis !== 'undefined' && globalThis.localStorage ? globalThis.localStorage.getItem(key) : null)
-    if (!raw) return {}
-    const parsed = JSON.parse(raw)
-    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-      const cleanMap = {}
-      for (const [id, list] of Object.entries(parsed)) {
-        const clean = sanitizeTagList(list)
-        if (clean.length) cleanMap[id] = clean
-      }
-      return cleanMap
+function cleanTagsMap(raw) {
+  const cleanMap = {}
+  if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+    for (const [id, list] of Object.entries(raw)) {
+      const clean = sanitizeTagList(list)
+      if (clean.length) cleanMap[id] = clean
     }
-    return {}
+  }
+  return cleanMap
+}
+
+// One-shot import of tags a pre-0.8.1 build saved in localStorage: move them into
+// ctx.storage, then delete the old entry so this never runs twice.
+function migrateLegacyTags(route, key) {
+  const legacyKey = storageKey(LEGACY_TAGS_STORAGE_BASE, route)
+  if (!legacyKey || typeof window === 'undefined') return {}
+  try {
+    const raw = window.localStorage?.getItem(legacyKey)
+    if (!raw) return {}
+    const migrated = cleanTagsMap(JSON.parse(raw))
+    if (Object.keys(migrated).length) pluginStorage.set(key, migrated)
+    window.localStorage.removeItem(legacyKey)
+    return migrated
   } catch {
     return {}
   }
 }
 
+function readSessionTagsMap(route) {
+  const key = tagsKey(route)
+  if (!key) return {}
+  const stored = pluginStorage.get(key, null)
+  if (stored !== null) return cleanTagsMap(stored)
+  if (legacyTagsChecked.has(key)) return {}
+  legacyTagsChecked.add(key)
+  return migrateLegacyTags(route, key)
+}
+
 function writeSessionTagsMap(route, map) {
   const key = tagsKey(route)
   if (!key) return
-  const cleanMap = {}
-  for (const [id, list] of Object.entries(map || {})) {
-    const clean = sanitizeTagList(list)
-    if (clean.length) cleanMap[id] = clean
-  }
-  try {
-    const storage = typeof window !== 'undefined' && window.localStorage
-      ? window.localStorage
-      : (typeof globalThis !== 'undefined' && globalThis.localStorage ? globalThis.localStorage : null)
-    if (storage) {
-      if (Object.keys(cleanMap).length === 0) {
-        storage.removeItem(key)
-      } else {
-        storage.setItem(key, JSON.stringify(cleanMap))
-      }
-    }
-  } catch (err) {
-    console.warn('[ha-sidebar-navigator] Failed to write session tags:', err)
-  }
+  const cleanMap = cleanTagsMap(map)
+  if (Object.keys(cleanMap).length) pluginStorage.set(key, cleanMap)
+  else pluginStorage.remove(key)
   bumpTagsRevision()
 }
 
@@ -1058,14 +1116,7 @@ function TagDialog({ open, onOpenChange, session, route }) {
 }
 
 function copySessionId(sessionId) {
-  if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
-    navigator.clipboard.writeText(sessionId).then(() => {
-      host.notify({ kind: 'success', message: 'Session ID copied to clipboard' })
-    }).catch(err => host.notifyError?.(err, 'Failed to copy session ID'))
-  } else if (typeof window !== 'undefined' && window.hermesDesktop?.writeClipboard) {
-    window.hermesDesktop.writeClipboard(sessionId)
-    host.notify({ kind: 'success', message: 'Session ID copied to clipboard' })
-  }
+  return copyWithToast(sessionId, 'Session ID')
 }
 
 async function mutateForRoute(route, method, params = {}) {
@@ -1786,18 +1837,7 @@ function SessionRow({ session, focused, project, allProjects, route }) {
   const [deleteOpen, setDeleteOpen] = useState(false)
 
   const [pinned, setPinned] = useState(() => isSessionPinned(session.id, session, route))
-  const [unread, setUnread] = useState(() => {
-    if (session.unread) return true
-    try {
-      const raw = typeof window !== 'undefined'
-        ? window.localStorage?.getItem(storageKey('hermes.desktop.unreadSessions', route))
-        : null
-      const list = raw ? JSON.parse(raw) : []
-      return Array.isArray(list) && list.includes(session.id)
-    } catch {
-      return false
-    }
-  })
+  const [unread, setUnread] = useState(() => Boolean(session.unread) || readIdList(route, 'unread').includes(session.id))
   const [colorOverride, setColorOverride] = useState(() => getSessionColorOverride(session.id, route))
 
   // Find target projects for "Move to project"
@@ -2392,14 +2432,7 @@ function ProjectCard({ project, allProjects, currentId, filterQuery, route }) {
                 ]
               }) : null,
               projectCwd ? jsxs(ContextMenuItem, {
-                onSelect: () => {
-                  if (typeof window !== 'undefined' && window.hermesDesktop?.writeClipboard) {
-                    window.hermesDesktop.writeClipboard(projectCwd)
-                  } else if (typeof navigator !== 'undefined' && navigator.clipboard) {
-                    navigator.clipboard.writeText(projectCwd)
-                  }
-                  host.notify({ kind: 'success', message: 'Project path copied to clipboard' })
-                },
+                onSelect: () => void copyWithToast(projectCwd, 'Project path'),
                 children: [
                   jsx(Codicon, { name: 'copy', size: '0.875rem' }),
                   jsx('span', { children: 'Copy path' })
@@ -2747,6 +2780,8 @@ export default {
   defaultEnabled: true,
 
   register(ctx) {
+    setPluginContext(ctx)
+
     // 1. Layout Pane: Can be docked on the left rail or stacked alongside sessions
     ctx.register({
       id: 'navigator-pane',
