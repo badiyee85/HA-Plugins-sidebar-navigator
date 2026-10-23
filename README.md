@@ -23,6 +23,8 @@ In Hermes Desktop, the default sidebar project view limits previews to **3 sessi
 - **Instant Search:** Live filter across titles, preview snippets, and session IDs as you type.
 - **Session Tags (v0.6):** Add up to 16 colour-coded tags per session (*Tags…* menu), then filter with the tag bar or `#tag` terms in the search box. Tags, colours and unread marks live in the plugin's own storage (`ctx.storage`), per profile route. Tags saved by older builds are imported automatically the first time you open a profile.
 
+- **Saved Views (v0.9):** Type a filter (or pick tags), click **Save view**, and name it. The view appears as a chip under the search box; one click restores both the filter and the Projects/Timeline mode. Saving under an existing name updates that view. Up to 20 views per profile; delete with the **×** on a chip.
+
 **See**
 - **Live Status (v0.4):** Status dots on session rows show live state for the active profile (other profiles show a neutral dot).
 - **Profile Identity Badges (v0.5):** A coloured profile glyph sits beside the status indicator so you can tell which profile a session belongs to.

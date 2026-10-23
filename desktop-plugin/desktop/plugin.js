@@ -65,6 +65,23 @@ export {
   addSessionTag,
   addToSelection,
   BULK_ACTIONS,
+  SavedViewsBar,
+  SaveViewDialog,
+  VIEWS_MAX,
+  VIEW_NAME_MAX,
+  applyView,
+  browseStateAtom,
+  deleteView,
+  getSavedViews,
+  normalizeViewName,
+  normalizeViewQuery,
+  queryAtom,
+  sanitizeViews,
+  saveView,
+  summarizeSaveView,
+  suggestViewName,
+  viewAtom,
+  viewIsActive,
   ShowMoreButton,
   SessionBrowser,
   ProjectBrowser,
@@ -955,6 +972,248 @@ function toggleTagInQuery(query, tag) {
   }
   const parts = [...text, ...tags.map(t => `#${t}`)]
   return parts.join(' ')
+}
+
+// ─── Saved Views ─────────────────────────────────────────────────────────────
+//
+// A saved view is a named search: the filter text (with any #tags) plus the
+// Projects/Timeline mode it was saved in. Stored per profile route in
+// ctx.storage because tags are per route, so a view's #tags only mean something
+// on the profile that owns them.
+
+const VIEWS_MAX = 20
+const VIEW_NAME_MAX = 32
+
+const viewsRevisionAtom = atom(0)
+let viewsRevisionCounter = 0
+function bumpViewsRevision() {
+  viewsRevisionCounter += 1
+  viewsRevisionAtom.set(viewsRevisionCounter)
+}
+
+function normalizeViewName(input) {
+  return String(input ?? '').replace(/\s+/g, ' ').trim().slice(0, VIEW_NAME_MAX).trim()
+}
+
+function normalizeViewQuery(input) {
+  return String(input ?? '').replace(/\s+/g, ' ').trim()
+}
+
+function normalizeViewMode(mode) {
+  return mode === 'sessions' ? 'sessions' : 'projects'
+}
+
+function suggestViewName(query) {
+  return normalizeViewName(normalizeViewQuery(query).replace(/#/g, ''))
+}
+
+// Storage is user-editable and cross-window, so never trust its shape.
+function sanitizeViews(list) {
+  if (!Array.isArray(list)) return []
+  const seen = new Set()
+  const views = []
+  for (const raw of list) {
+    if (!raw || typeof raw !== 'object') continue
+    const name = normalizeViewName(raw.name)
+    const query = normalizeViewQuery(raw.query)
+    const id = typeof raw.id === 'string' ? raw.id : ''
+    if (!name || !query || !id || seen.has(name.toLowerCase())) continue
+    seen.add(name.toLowerCase())
+    views.push({ id, name, query, mode: normalizeViewMode(raw.mode) })
+    if (views.length >= VIEWS_MAX) break
+  }
+  return views
+}
+
+function viewsKey(route) {
+  return storageKey('views', route)
+}
+
+function getSavedViews(route) {
+  const key = viewsKey(route)
+  return key ? sanitizeViews(pluginStorage.get(key, [])) : []
+}
+
+function writeSavedViews(route, views) {
+  const key = viewsKey(route)
+  if (!key) return false
+  if (views.length) pluginStorage.set(key, views)
+  else pluginStorage.remove(key)
+  bumpViewsRevision()
+  return true
+}
+
+let viewIdCounter = 0
+function newViewId() {
+  viewIdCounter += 1
+  return `v${Date.now().toString(36)}${viewIdCounter.toString(36)}`
+}
+
+// Saving under an existing name (any case) updates that view in place, so
+// "re-save to change what it filters" works without a separate edit flow.
+function saveView(route, { name, query, mode } = {}) {
+  const cleanName = normalizeViewName(name)
+  const cleanQuery = normalizeViewQuery(query)
+  if (!viewsKey(route)) return { ok: false, reason: 'unavailable' }
+  if (!cleanName) return { ok: false, reason: 'name' }
+  if (!cleanQuery) return { ok: false, reason: 'query' }
+
+  const views = getSavedViews(route)
+  const existing = views.findIndex(v => v.name.toLowerCase() === cleanName.toLowerCase())
+  const view = {
+    id: existing >= 0 ? views[existing].id : newViewId(),
+    name: cleanName,
+    query: cleanQuery,
+    mode: normalizeViewMode(mode)
+  }
+  if (existing >= 0) views[existing] = view
+  else if (views.length >= VIEWS_MAX) return { ok: false, reason: 'limit' }
+  else views.push(view)
+
+  writeSavedViews(route, views)
+  return { ok: true, view, replaced: existing >= 0 }
+}
+
+function deleteView(route, id) {
+  const views = getSavedViews(route)
+  const next = views.filter(v => v.id !== id)
+  if (next.length === views.length) return false
+  writeSavedViews(route, next)
+  return true
+}
+
+function viewIsActive(view, query, mode) {
+  return (
+    normalizeViewQuery(query).toLowerCase() === view.query.toLowerCase() &&
+    normalizeViewMode(mode) === view.mode
+  )
+}
+
+function applyView(view) {
+  queryAtom.set(view.query)
+  setView(view.mode)
+}
+
+function summarizeSaveView(result, name) {
+  if (result.ok) {
+    return { kind: 'success', message: `${result.replaced ? 'Updated' : 'Saved'} view “${result.view.name}”` }
+  }
+  const reasons = {
+    name: 'Give the view a name',
+    query: 'Type a filter or pick a tag first',
+    limit: `You can keep up to ${VIEWS_MAX} views. Delete one first`,
+    unavailable: 'Views are unavailable for this profile'
+  }
+  return { kind: 'error', message: reasons[result.reason] || `Could not save “${normalizeViewName(name)}”` }
+}
+
+function SaveViewDialog({ open, onOpenChange, route, query, mode }) {
+  const [name, setName] = useState(() => suggestViewName(query))
+  const submit = () => {
+    const result = saveView(route, { name, query, mode })
+    host.notify(summarizeSaveView(result, name))
+    if (result.ok) onOpenChange(false)
+    return result
+  }
+  return jsx(Dialog, {
+    open,
+    onOpenChange,
+    children: jsxs(DialogContent, {
+      className: 'max-w-sm p-4',
+      children: [
+        jsxs(DialogHeader, {
+          children: [
+            jsx(DialogTitle, { children: 'Save view' }),
+            jsx('p', {
+              className: 'mt-0.5 text-xs text-(--ui-text-quaternary) break-words',
+              children: `${normalizeViewMode(mode) === 'sessions' ? 'Timeline' : 'Projects'} · ${normalizeViewQuery(query)}`
+            })
+          ]
+        }),
+        jsx(Input, {
+          autoFocus: true,
+          placeholder: 'View name…',
+          value: name,
+          maxLength: VIEW_NAME_MAX,
+          onChange: (e) => setName(e.target.value),
+          onKeyDown: (e) => {
+            if (e.key === 'Enter' && !e.nativeEvent?.isComposing) {
+              e.preventDefault()
+              submit()
+            }
+          },
+          className: 'mt-2 w-full text-xs'
+        }),
+        jsxs(DialogFooter, {
+          className: 'mt-3 pt-2 border-t border-(--ui-stroke-secondary) flex justify-end gap-1.5',
+          children: [
+            jsx(Button, { type: 'button', variant: 'ghost', onClick: () => onOpenChange(false), children: 'Cancel' }),
+            jsx(Button, { type: 'button', disabled: !normalizeViewName(name), onClick: submit, children: 'Save' })
+          ]
+        })
+      ]
+    })
+  })
+}
+
+function SavedViewsBar({ route, className }) {
+  useValue(viewsRevisionAtom)
+  const query = useValue(queryAtom)
+  const mode = useValue(viewAtom)
+  const [saveOpen, setSaveOpen] = useState(false)
+  if (!route) return null
+
+  const views = getSavedViews(route)
+  const canSave = Boolean(normalizeViewQuery(query)) && !views.some(v => viewIsActive(v, query, mode))
+  if (!views.length && !canSave) return null
+
+  return jsxs('div', {
+    className: `flex items-center gap-1 overflow-x-auto py-0.5 no-scrollbar ${className || ''}`.trim(),
+    role: 'group',
+    'aria-label': 'Saved views',
+    children: [
+      jsx('span', {
+        className: 'shrink-0 text-[0.625rem] font-semibold uppercase tracking-wider text-(--ui-text-quaternary)',
+        children: 'Views:'
+      }),
+      ...views.map(view => {
+        const active = viewIsActive(view, query, mode)
+        return jsxs('span', {
+          key: view.id,
+          className: `inline-flex shrink-0 items-center rounded-md border text-[0.6875rem] ${active ? 'border-(--ui-accent) bg-(--ui-accent)/15 text-(--ui-text-primary)' : 'border-(--ui-stroke-secondary) text-(--ui-text-secondary)'}`,
+          children: [
+            jsx('button', {
+              type: 'button',
+              className: 'rounded-l-md px-1.5 py-0.5 hover:bg-(--chrome-action-hover)',
+              'aria-pressed': active,
+              title: `${view.mode === 'sessions' ? 'Timeline' : 'Projects'} · ${view.query}`,
+              onClick: () => applyView(view),
+              children: view.name
+            }),
+            jsx('button', {
+              type: 'button',
+              className: 'rounded-r-md px-1 py-0.5 text-(--ui-text-quaternary) hover:bg-(--chrome-action-hover) hover:text-(--ui-text-primary)',
+              'aria-label': `Delete view ${view.name}`,
+              title: 'Delete view',
+              onClick: () => {
+                deleteView(route, view.id)
+                host.notify({ kind: 'info', message: `Deleted view “${view.name}”` })
+              },
+              children: '×'
+            })
+          ]
+        })
+      }),
+      canSave ? jsxs('button', {
+        type: 'button',
+        className: 'inline-flex shrink-0 items-center gap-1 rounded-md border border-dashed border-(--ui-stroke-secondary) px-1.5 py-0.5 text-[0.6875rem] text-(--ui-text-secondary) hover:bg-(--chrome-action-hover) hover:text-(--ui-text-primary)',
+        title: 'Save the current filter as a view',
+        onClick: () => setSaveOpen(true),
+        children: [jsx(Codicon, { name: 'bookmark', size: '0.75rem' }), jsx('span', { children: 'Save view' })]
+      }) : null,
+      saveOpen ? jsx(SaveViewDialog, { open: saveOpen, onOpenChange: setSaveOpen, route, query, mode }) : null
+    ]
+  })
 }
 
 // ─── Tag UI Components ───────────────────────────────────────────────────────
@@ -2835,7 +3094,8 @@ function NavigatorShell({ onClose } = {}) {
             value: q,
             onChange: (e) => queryAtom.set(e.target.value),
             className: 'w-full rounded-md border border-(--ui-stroke-secondary) bg-(--ui-bg-subtle) px-2.5 py-1 text-xs text-(--ui-text-primary) outline-none placeholder:text-(--ui-text-quaternary) focus:border-(--ui-accent)'
-          })
+          }),
+          jsx(SavedViewsBar, { route: selectedRoute }, routeKey(selectedRoute) || 'no-route')
         ]
       }),
       selectMode && selectedRoute ? jsx(BulkBar, { route: selectedRoute }, routeKey(selectedRoute)) : null,
@@ -2907,6 +3167,7 @@ export default {
         if (!event?.key || String(event.key).includes(`hermes.plugin.${ID}.`)) {
           invalidateTagsCache()
           bumpTagsRevision()
+          bumpViewsRevision()
         }
       })
     }
