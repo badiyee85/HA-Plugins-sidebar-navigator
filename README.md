@@ -10,12 +10,27 @@ Full-power project and session navigator for **Hermes Desktop**. Bypasses the de
 In Hermes Desktop, the default sidebar project view limits previews to **3 sessions** per project (`PROJECT_PREVIEW_COUNT = 3`). As your project grows to dozens or hundreds of sessions, older sessions are hidden and impossible to browse or scroll without tedious search terms.
 
 ## The Solution: Sidebar Navigator
-**Sidebar Navigator** is a lightweight, contribution-driven edge plugin that runs entirely on `@hermes/plugin-sdk` without modifying core files:
+**Sidebar Navigator** is a lightweight, contribution-driven edge plugin that runs entirely on `@hermes/plugin-sdk` without modifying core files.
+
+**Browse**
 - **No 3-Session Cap:** Retrieves complete project trees and queries `projects.project_sessions` up to 2,000 sessions per project.
-- **Inner-Scrolling Project Cards:** Each project displays its full session count and has an inner-scrollable list with smooth scrolling.
-- **Instant Search:** Live filter queries titles, preview snippets, and session IDs as you type.
-- **Projects & Timeline Modes:** Switch between grouped project trees and a flat chronological timeline of all recent chats.
+- **Inner-Scrolling Project Cards:** Each project shows its full session count and an inner-scrollable list.
+- **Projects & Timeline Modes:** Grouped project trees, or a flat newest-first timeline of recent chats.
+- **Profile Browsing:** A *Browse profile* selector lets you explore any profile's (and connection's) projects and sessions, not just the active one. Falls back to the active profile on older Hermes Desktop builds, and shows the real backend reason when a profile fails to load.
 - **One-Click Jump:** Direct navigation to `#/<sessionId>` in the main conversation workspace.
+
+**Find**
+- **Instant Search:** Live filter across titles, preview snippets, and session IDs as you type.
+- **Session Tags (v0.6):** Add up to 16 colour-coded tags per session (*Tags…* menu), then filter with the tag bar or `#tag` terms in the search box. Tags are stored locally per profile route.
+
+**See**
+- **Live Status (v0.4):** Status dots on session rows show live state for the active profile (other profiles show a neutral dot).
+- **Profile Identity Badges (v0.5):** A coloured profile glyph sits beside the status indicator so you can tell which profile a session belongs to.
+
+**Act (right-click menus)**
+- **Session menu:** New window, Rename, Pin, Mark unread, Appearance (colour), Copy ID, Tags, Branch, Export (JSON), Move to project, Archive, Delete.
+- **Where chooser (v0.7):** *New session (choose location)…* on sessions, project cards, and the Navigator background opens a dialog to start a session in Home or any project, with a project filter.
+- **Project menu:** New session, Open Cockpit, Copy path.
 
 ---
 
@@ -29,8 +44,11 @@ Click **Navigator** in the left sidebar menu (or press `Cmd/Ctrl + K` and search
 ### 2. Browse by Project
 Projects are listed with their folder badges, session counts, and expandable conversation lists. 
 
-### 3. Filter or Switch to Timeline
-Use the search bar at the top to filter across all projects simultaneously, or toggle **Timeline** to see every conversation newest-first.
+### 3. Filter, Tag, or Switch to Timeline
+Use the search bar to filter across all projects simultaneously, click tags in the tag bar to narrow further, or toggle **Timeline** to see every conversation newest-first.
+
+### 4. Act on Sessions
+Right-click any session, project, or the empty Navigator background for the full action menu (rename, branch, export, move, archive, delete, new session in a chosen location).
 
 ---
 
