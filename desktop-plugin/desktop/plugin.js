@@ -65,6 +65,10 @@ export {
   addSessionTag,
   addToSelection,
   BULK_ACTIONS,
+  branchSession,
+  fetchSessionMessages,
+  renameSession,
+  withStoredSession,
   SavedViewsBar,
   SaveViewDialog,
   VIEWS_MAX,
@@ -1460,25 +1464,70 @@ async function openSessionSafely(route, sessionId, intent = 'in-place') {
   }
 }
 
+// A stored session (what the Navigator lists) has no runtime id until it is
+// loaded, and the gateway's per-session calls (session.title, session.history)
+// only accept runtime ids; sent a stored id they answer "session not found".
+// withStoredSession borrows the live handle when the session is already open in
+// this window, and otherwise resumes it for the duration of `fn` and closes it
+// again. It never closes a handle it did not open: resuming a session that is
+// already live returns the SAME runtime id, so closing it would end the user's
+// open session.
+async function withStoredSession(route, storedId, fn) {
+  const active = await requestForRoute(route, 'session.active_list', {}, host, undefined, { fresh: true })
+  const open = (active?.sessions || []).find(row => row?.session_key === storedId)
+  if (open?.id) return fn(open.id)
+
+  const resumed = await requestForRoute(route, 'session.resume', { session_id: storedId, lazy: true })
+  const runtimeId = resumed?.session_id
+  if (!runtimeId) throw new Error('Could not open the session')
+  try {
+    return await fn(runtimeId)
+  } finally {
+    try {
+      await requestForRoute(route, 'session.close', { session_id: runtimeId })
+    } catch {
+      // Best effort: the backend reaps detached runtimes on its own.
+    }
+  }
+}
+
+async function renameSession(session, route, title) {
+  clearRouteCatalogCache()
+  const result = await withStoredSession(route, session.id, runtimeId =>
+    requestForRoute(route, 'session.title', { session_id: runtimeId, title })
+  )
+  invalidateRoute(route)
+  return result
+}
+
+function fetchSessionMessages(session, route) {
+  return withStoredSession(route, session.id, async runtimeId => {
+    const history = await requestForRoute(route, 'session.history', { session_id: runtimeId })
+    return history?.messages || []
+  })
+}
+
 async function branchSession(session, route) {
   host.notify({ kind: 'info', message: 'Branching session…' })
   try {
-    const result = await mutateForRoute(route, 'session.branch', { session_id: session.id })
-    const newId = result?.stored_session_id || result?.session_key || result?.session_id
+    // branch_stored copies the transcript on the backend; it takes the stored id as parent_session_id.
+    const result = await mutateForRoute(route, 'session.branch_stored', { parent_session_id: session.id })
+    const newId = result?.stored_session_id
     if (!newId) throw new Error('Branch did not return a session id')
     invalidateRoute(route)
     await openSessionForRoute(route, newId)
     host.notify({ kind: 'success', message: 'Branched to new session' })
+    return newId
   } catch (err) {
     host.notifyError?.(err, 'Failed to branch session')
+    return null
   }
 }
 
 async function exportSession(session, route) {
   host.notify({ kind: 'info', message: 'Preparing session export…' })
   try {
-    const result = await requestForRoute(route, 'session.history', { session_id: session.id })
-    const messages = result?.messages || []
+    const messages = await fetchSessionMessages(session, route)
     const payload = {
       exported_at: new Date().toISOString(),
       session_id: session.id,
@@ -2188,8 +2237,7 @@ function SessionRow({ session, focused, project, allProjects, route }) {
     }
     setRenaming(true)
     try {
-      await mutateForRoute(route, 'session.title', { session_id: session.id, title: next })
-      invalidateRoute(route)
+      await renameSession(session, route, next)
       host.notify({ kind: 'success', message: 'Renamed session' })
       setRenameOpen(false)
     } catch (err) {

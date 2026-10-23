@@ -33,3 +33,8 @@ This project complies strictly with the curated Hermes Plugin Catalog standards 
 - **Runtime:** Loaded dynamically by Hermes Desktop from `$HERMES_HOME/desktop-plugins/ha-sidebar-navigator/plugin.js`.
 - **Imports:** Restricted strictly to `@hermes/plugin-sdk`, `react`, and `react/jsx-runtime`.
 - **Data Layer:** Uses the unified React Query client via `useQuery` to avoid redundant background poll loops.
+
+## Testing Contract
+- Run everything from the repo root: `node --loader ./tests/loader.mjs --test tests/*.test.mjs`.
+- Mocked-host tests (`tests/*.test.mjs`) prove what the plugin sends; `tests/live-backend.test.mjs` proves the real Hermes gateway accepts it. Any new backend RPC needs a live test, and a UI-visible feature needs one mutation check (break the behaviour, watch a named test fail, restore).
+- Do not hand Badi a build to find backend failures. Verify against the real gateway first.
