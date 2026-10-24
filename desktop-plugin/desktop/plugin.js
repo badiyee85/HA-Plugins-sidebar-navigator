@@ -157,10 +157,11 @@ const ID = 'ha-sidebar-navigator'
 const LEGACY_ACTIVE_CONNECTION = '__legacy_active__'
 const LEGACY_ROUTE_MODE = 'legacy'
 const ROUTE_CACHE_TTL_MS = 5000
-// How long reads reuse the route catalog. `host.profileRoutes()` is not cheap on a
-// remote Desktop: it refetches /api/profiles and has Electron enumerate every
-// registry source (the slowest source sets the time). Navigator open, Refresh and
-// every action re-resolve fresh; a read that fails re-checks its route once.
+// Upper bound on how long reads may use the route catalog without blocking on a
+// new lookup. `host.profileRoutes()` is not cheap on a remote Desktop: it refetches
+// /api/profiles and has Electron enumerate every registry source (the slowest one
+// sets the time). Reads re-check it in the background every ROUTE_CACHE_TTL_MS;
+// Navigator open, Refresh and every action resolve it fresh before acting.
 const ROUTE_CATALOG_TTL_MS = 5 * 60 * 1000
 const ROUTE_UNAVAILABLE = 'route_unavailable'
 
@@ -337,6 +338,7 @@ function activeOwner() {
 let routeCatalogHost = null
 let routeCatalog = []
 let routeCatalogExpiresAt = 0
+let routeCatalogFetchedAt = 0
 let routeCatalogPromise = null
 let routeCatalogGeneration = 0
 
@@ -345,6 +347,7 @@ function clearRouteCatalogCache() {
   routeCatalogHost = null
   routeCatalog = []
   routeCatalogExpiresAt = 0
+  routeCatalogFetchedAt = 0
   routeCatalogPromise = null
 }
 
@@ -365,7 +368,8 @@ async function currentRoutes(transportHost = host, fresh = false) {
       const routes = normalizeRoutes(raw)
       if (generation === routeCatalogGeneration && routeCatalogHost === transportHost) {
         routeCatalog = routes
-        routeCatalogExpiresAt = Date.now() + ROUTE_CATALOG_TTL_MS
+        routeCatalogFetchedAt = Date.now()
+        routeCatalogExpiresAt = routeCatalogFetchedAt + ROUTE_CATALOG_TTL_MS
       }
       return routes
     })
@@ -386,33 +390,56 @@ async function routeForRequest(route, transportHost = host, fresh = false) {
   const routes = await currentRoutes(transportHost, fresh)
   if (routes) {
     const current = reconcileRoute(normalized, routes)
-    if (!current) {
-      const gone = new Error('The selected profile route is no longer available. Refresh Navigator.')
-      gone.code = ROUTE_UNAVAILABLE
-      throw gone
-    }
+    if (!current) throw routeGone()
     return current
   }
   return normalized
 }
 
+function routeGone() {
+  const gone = new Error('The selected profile route is no longer available. Refresh Navigator.')
+  gone.code = ROUTE_UNAVAILABLE
+  return gone
+}
+
+// Reads use the cached catalog at once and re-check it in the background, at
+// most every ROUTE_CACHE_TTL_MS and one lookup at a time. That keeps the same
+// freshness as resolving before every read without making the read wait for it.
+// A route found gone or replaced has its Navigator queries invalidated, so the
+// next read reports it instead of showing another backend's data.
+function revalidateRoutes(route, transportHost) {
+  if (routeCatalogHost !== transportHost || routeCatalogPromise) return
+  if (Date.now() - routeCatalogFetchedAt < ROUTE_CACHE_TTL_MS) return
+  void currentRoutes(transportHost, true)
+    .then(routes => {
+      if (routes && !reconcileRoute(normalizeRoute(route), routes)) invalidateRoute(route)
+    })
+    .catch(() => {})
+}
+
+// After a failed read: wait for the lookup already in flight (or use the catalog,
+// which is at most ROUTE_CACHE_TTL_MS old) and say so if the route is gone. A
+// failed lookup leaves the original error in place.
+async function routeStillThere(route, transportHost) {
+  if (routeCatalogHost !== transportHost) return true
+  try {
+    const routes = await (routeCatalogPromise || routeCatalog)
+    return !routes || Boolean(reconcileRoute(normalizeRoute(route), routes))
+  } catch {
+    return true
+  }
+}
+
 async function requestForRoute(route, method, params = {}, transportHost = host, owner = undefined, options = {}) {
   const fresh = Boolean(options.fresh)
   const normalized = await routeForRequest(route, transportHost, fresh)
+  const cached = !fresh && !isLegacyRoute(normalized)
+  if (cached) revalidateRoutes(route, transportHost)
   try {
     return await dispatchForRoute(normalized, method, params, transportHost, owner)
   } catch (error) {
-    // The catalog is reused for minutes, so a failure may mean the route itself
-    // went away. Re-check it once (which also refreshes the cache for the next
-    // call): a vanished route gets the clear "no longer available" error. The call
-    // is never re-sent, so a write cannot run twice.
-    if (!fresh && !isLegacyRoute(normalized)) {
-      try {
-        await routeForRequest(route, transportHost, true)
-      } catch (recheck) {
-        if (recheck?.code === ROUTE_UNAVAILABLE) throw recheck
-      }
-    }
+    // The call is never re-sent, so a write cannot run twice.
+    if (cached && !(await routeStillThere(route, transportHost))) throw routeGone()
     throw error
   }
 }

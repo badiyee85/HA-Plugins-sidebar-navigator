@@ -38,15 +38,17 @@
 
 ## Performance notes (v0.9.1): remote Desktop
 - On a Desktop connected to a remote Hermes (VDS, home server), the slow part was not the backend or the rows: `host.profileRoutes()` refetches `/api/profiles` and makes Electron enumerate every saved connection (slowest one wins), and `requestForRoute` re-ran it before any read once its route cache was older than 5 s. The Timeline is usually opened later than that, so it paid the whole lookup before `session.list`, as did every 15 s refetch.
-- Reads now reuse the route catalog for `ROUTE_CATALOG_TTL_MS` (5 min). Navigator open, the Refresh button and every action still resolve the route fresh. A failed read re-checks its route once: if the route is gone the user gets the "no longer available" error; otherwise the original error stands. The call is never re-sent, so a write cannot run twice.
+- Reads use the cached route catalog at once and never wait for a roster lookup. The catalog is re-checked in the background at most every `ROUTE_CACHE_TTL_MS` (5 s), one lookup at a time, which keeps the old freshness without the wait. If the re-check finds the route removed or replaced (same connection, different backend profile), the route's Navigator queries are invalidated and the next read fails with "no longer available" instead of showing another backend's sessions. `ROUTE_CATALOG_TTL_MS` (5 min) is only a hard ceiling after which a read blocks on a fresh lookup.
+- Navigator open, the Refresh button and every action (`mutateForRoute`, `withStoredSession`, bulk, open) still resolve the route fresh before acting.
+- A failed read is never re-sent (a write cannot run twice). It waits for the lookup already in flight, or uses the catalog (at most 5 s old), and reports "no longer available" only if the route is really gone; otherwise its own error stands. Concurrent failures and React Query retries share one lookup, so an outage does not set off a lookup storm.
 - The Navigator prefetches the Timeline's session list (`prefetchTimeline`, same definition as the Timeline via `sessionListQuery`) when a profile is selected, so switching to Timeline shows rows at once. The prefetch is one fetch and adds no poll.
-- Measured backend cost on a real store: `session.list` 8-43 ms, `projects.tree` 17-112 ms, `profiles.list` 18-546 ms. The plugin-side harness (fake host, 400 ms roster stand-in) went from 461 ms to 61 ms for a Timeline click. Not yet timed in the live app.
+- Measured backend cost on a real store: `session.list` 8-43 ms, `projects.tree` 17-112 ms, `profiles.list` 18-546 ms. The plugin-side harness (fake host, 400 ms roster stand-in) went from 461 ms to 60 ms for a Timeline click, with the roster lookup moved off the critical path. Not yet timed in the live app.
 
 ## Registration surfaces
 - Left-rail pane (`navigator-pane`), full page route `/navigator`, sidebar nav item, and command-palette action *Sidebar Navigator: Open All Projects & Sessions*.
 
 ## Tests
-- Run from repo root: `node --loader ./tests/loader.mjs --test tests/*.test.mjs` (128 tests: 118 against stubbed Desktop objects, 10 against the real Hermes gateway).
+- Run from repo root: `node --loader ./tests/loader.mjs --test tests/*.test.mjs` (131 tests: 121 against stubbed Desktop objects, 10 against the real Hermes gateway).
 
 ## Catalog pin
 - Authoritative pin lives upstream in `NousResearch/hermes-agent/plugin-catalog/ha-sidebar-navigator.yaml`. `plugin-catalog/ha-sidebar-navigator.yaml` here is a local reference copy and may lag the upstream pin.

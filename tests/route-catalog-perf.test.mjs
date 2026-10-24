@@ -1,9 +1,15 @@
 // Why the Timeline was slow on a remote Desktop: every read re-ran the full
-// profile/connection roster (`host.profileRoutes()`) once a 5 s route cache
-// expired, so a view opened later than the first one paid it before its own call.
-// These tests pin the contract: reads reuse the catalog, actions stay fresh, a
-// failed read re-checks its route once without re-sending, and the Timeline is
-// warmed with the same query it later reads.
+// profile/connection roster (`host.profileRoutes()`) before its own call once a
+// 5 s route cache expired, so a view opened later than the first one paid it.
+// These tests pin the contract that replaced it, without losing the old safety:
+// - a read never waits for the roster; the roster is re-checked in the background
+//   at most every 5 s, one lookup at a time;
+// - a route the re-check finds gone or replaced is invalidated and the next read
+//   reports it instead of showing another backend's sessions;
+// - a failed read is never re-sent, shares the lookup in flight, and keeps its own
+//   error unless the route is really gone;
+// - actions always resolve the route fresh;
+// - the Timeline is warmed with the same query it later reads.
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import {
@@ -11,6 +17,7 @@ import {
   ROUTE_CATALOG_TTL_MS,
   SessionBrowser,
   prefetchTimeline,
+  queryKey,
   requestForRoute,
   sessionListQuery
 } from '../desktop-plugin/desktop/plugin.js'
@@ -19,17 +26,25 @@ import { setEffectRunner } from './react-stub.mjs'
 
 const remote = { connectionId: 'vds', mode: 'remote', profile: 'default', targetProfile: 'default' }
 const legacy = { connectionId: '__legacy_active__', mode: 'legacy', profile: 'default', targetProfile: 'default' }
+const tick = () => new Promise(resolve => setImmediate(resolve))
 
 // A host whose roster lookups and RPCs are counted. `catalog` is what the next
-// profileRoutes() call answers; `fail` makes requestProfile reject.
-function countingHost({ catalog = [remote], fail = null, rosterError = null } = {}) {
+// profileRoutes() call answers; `hold()` makes the next lookups wait until
+// `release()`; `fail` makes requestProfile reject.
+function countingHost({ catalog = [remote] } = {}) {
   const stats = { roster: 0, rpc: [] }
+  let gate = null
   const h = {
     stats,
     catalog,
+    fail: null,
+    rosterError: null,
     state: { profile: { get: () => 'default' }, connectionId: { get: () => 'vds' } },
+    hold() { let open; gate = { promise: new Promise(r => { open = r }), open } },
+    release() { const g = gate; gate = null; g?.open() },
     profileRoutes: async () => {
       stats.roster += 1
+      if (gate) await gate.promise
       if (h.rosterError) throw h.rosterError
       return h.catalog
     },
@@ -39,8 +54,6 @@ function countingHost({ catalog = [remote], fail = null, rosterError = null } = 
       return { method }
     }
   }
-  h.fail = fail
-  h.rosterError = rosterError
   return h
 }
 
@@ -53,24 +66,52 @@ function withClockSkew(fn) {
   return Promise.resolve(fn(advance)).finally(() => { Date.now = realNow })
 }
 
-test('reads reuse the route catalog long after the old 5 s window', () =>
+// Record which query keys the plugin invalidates.
+async function withInvalidationSpy(fn) {
+  const original = queryClient.invalidateQueries
+  const keys = []
+  queryClient.invalidateQueries = async ({ queryKey: key }) => { keys.push(key) }
+  try {
+    return await fn(keys)
+  } finally {
+    queryClient.invalidateQueries = original
+  }
+}
+
+test('a read never waits for the roster lookup', () =>
   withClockSkew(async advance => {
     const h = countingHost()
     await requestForRoute(remote, 'projects.tree', {}, h, undefined, { fresh: true }) // Navigator open
     assert.equal(h.stats.roster, 1)
 
-    advance(6000) // user clicks Timeline a few seconds later
-    await Promise.all([
-      requestForRoute(remote, 'session.list', {}, h),
-      requestForRoute(remote, 'projects.tree', {}, h)
-    ])
-    advance(15000) // background refetch
-    await requestForRoute(remote, 'session.list', {}, h)
-    assert.equal(h.stats.roster, 1, 'reads inside the TTL must not re-run the roster')
+    advance(6000) // the user clicks Timeline a few seconds later
+    h.hold() // and the roster lookup is slow
+    const answered = await requestForRoute(remote, 'session.list', {}, h)
+    assert.equal(answered.method, 'session.list', 'the read is answered while the lookup is still pending')
+    assert.equal(h.stats.roster, 2, 'the lookup runs, but in the background')
 
-    advance(ROUTE_CATALOG_TTL_MS) // staleness stays bounded
+    await requestForRoute(remote, 'projects.tree', {}, h)
+    assert.equal(h.stats.roster, 2, 'one lookup at a time')
+    h.release()
+    await tick()
+
     await requestForRoute(remote, 'session.list', {}, h)
-    assert.equal(h.stats.roster, 2)
+    assert.equal(h.stats.roster, 2, 'no new lookup within 5 s of the last one')
+
+    advance(6000) // 15 s refetch: re-checked again, still without waiting
+    await requestForRoute(remote, 'session.list', {}, h)
+    assert.equal(h.stats.roster, 3)
+    await tick()
+  }))
+
+test('a read still resolves fresh when the catalog is older than the hard limit', () =>
+  withClockSkew(async advance => {
+    const h = countingHost()
+    await requestForRoute(remote, 'session.list', {}, h, undefined, { fresh: true })
+    advance(ROUTE_CATALOG_TTL_MS + 1000)
+    h.catalog = []
+    await assert.rejects(requestForRoute(remote, 'session.list', {}, h), { code: 'route_unavailable' })
+    assert.equal(h.stats.rpc.length, 1, 'nothing sent on a route that is gone')
   }))
 
 test('actions still resolve the route fresh every time', async () => {
@@ -81,32 +122,70 @@ test('actions still resolve the route fresh every time', async () => {
   assert.equal(h.stats.roster, 3)
 })
 
-test('a read on a route that disappeared reports it clearly and is not re-sent', async () => {
-  const h = countingHost()
-  await requestForRoute(remote, 'session.list', {}, h, undefined, { fresh: true })
-  h.catalog = [] // the connection was removed while the cache still lists it
-  h.fail = new Error('socket closed')
+for (const [label, change] of [
+  ['removed', () => []],
+  ['replaced by another backend profile', () => [{ ...remote, targetProfile: 'someone-else' }]]
+]) {
+  test(`a route ${label} while the Navigator is open is caught by the background re-check`, () =>
+    withInvalidationSpy(keys =>
+      withClockSkew(async advance => {
+        const h = countingHost()
+        await requestForRoute(remote, 'session.list', {}, h, undefined, { fresh: true })
+        advance(6000)
+        h.catalog = change()
+        await requestForRoute(remote, 'session.list', {}, h) // served, re-check runs behind it
+        await tick()
+        assert.ok(
+          keys.some(key => JSON.stringify(key) === JSON.stringify(queryKey('sessions', remote))),
+          'the Navigator queries for that route are invalidated'
+        )
+        const sent = h.stats.rpc.length
+        await assert.rejects(requestForRoute(remote, 'session.list', {}, h), { code: 'route_unavailable' })
+        assert.equal(h.stats.rpc.length, sent, 'the next read is not sent to the old route')
+      })))
+}
 
-  await assert.rejects(requestForRoute(remote, 'session.title', { title: 'x' }, h), {
-    code: 'route_unavailable',
-    message: /no longer available/
-  })
-  assert.equal(h.stats.rpc.filter(([m]) => m === 'session.title').length, 1, 'the call must never be sent twice')
-  assert.equal(h.stats.roster, 2, 'exactly one re-check')
-})
+test('a failed read on a route that disappeared says so and is not re-sent', () =>
+  withClockSkew(async advance => {
+    const h = countingHost()
+    await requestForRoute(remote, 'session.list', {}, h, undefined, { fresh: true })
+    advance(6000)
+    h.catalog = [] // the connection was removed
+    h.fail = new Error('socket closed')
+    await assert.rejects(requestForRoute(remote, 'session.title', { title: 'x' }, h), {
+      code: 'route_unavailable',
+      message: /no longer available/
+    })
+    assert.equal(h.stats.rpc.filter(([m]) => m === 'session.title').length, 1, 'the call must never be sent twice')
+    assert.equal(h.stats.roster, 2, 'it reused the background lookup, no extra one')
+  }))
 
-test('a read that fails on a live route keeps its own error', async () => {
-  const h = countingHost()
-  await requestForRoute(remote, 'session.list', {}, h, undefined, { fresh: true })
-  h.fail = new Error('backend busy')
-  await assert.rejects(requestForRoute(remote, 'session.list', {}, h), { message: 'backend busy' })
-  assert.equal(h.stats.roster, 2)
-  assert.equal(h.stats.rpc.length, 2, 'the failed call is sent once, never retried here')
+test('failed reads keep their own error and do not start a lookup storm', () =>
+  withClockSkew(async advance => {
+    const h = countingHost()
+    await requestForRoute(remote, 'session.list', {}, h, undefined, { fresh: true })
+    h.fail = new Error('backend busy')
 
-  // If the re-check itself fails (network down), the original error still wins.
-  h.rosterError = new Error('roster offline')
-  await assert.rejects(requestForRoute(remote, 'session.list', {}, h), { message: 'backend busy' })
-})
+    // Within 5 s of a lookup: the catalog is as fresh as it ever was, no new lookup.
+    await assert.rejects(requestForRoute(remote, 'session.list', {}, h), { message: 'backend busy' })
+    assert.equal(h.stats.roster, 1)
+    assert.equal(h.stats.rpc.length, 2, 'the failed call is sent once, never retried here')
+
+    // An outage later on: four failing reads (and their retries) share one lookup.
+    advance(6000)
+    h.hold()
+    const failures = [1, 2, 3, 4].map(() => requestForRoute(remote, 'session.list', {}, h).catch(e => e))
+    await tick()
+    h.release()
+    const errors = await Promise.all(failures)
+    assert.deepEqual(errors.map(e => e.message), Array(4).fill('backend busy'))
+    assert.equal(h.stats.roster, 2)
+
+    // If the lookup itself fails (network down), the original error still wins.
+    advance(6000)
+    h.rosterError = new Error('roster offline')
+    await assert.rejects(requestForRoute(remote, 'session.list', {}, h), { message: 'backend busy' })
+  }))
 
 test('the Timeline prefetch warms exactly the query the Timeline reads', async () => {
   const seen = []
