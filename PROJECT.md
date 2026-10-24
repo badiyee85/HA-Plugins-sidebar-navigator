@@ -7,7 +7,7 @@
 - **Primary Lane:** `badiyee85`
 - **Target Surface:** Hermes Desktop App (`desktop-plugins/ha-sidebar-navigator/plugin.js`)
 
-## Features (v0.9.0)
+## Features (v0.9.1)
 - Complete project session lists without the 3-item truncation (up to 2,000 sessions per project).
 - Search across all projects and sessions (title, preview, ID).
 - Projects view and chronological Timeline view.
@@ -36,11 +36,17 @@
 - The Timeline's project list (Move menu) uses `projects.tree` with `preview_limit: 1` under its own query key (`projects-list`), never the Projects view's `projects-tree` entry.
 - The full-page route has its own Close button (history back, else home). The docked pane relies on the app's pane chrome.
 
+## Performance notes (v0.9.1): remote Desktop
+- On a Desktop connected to a remote Hermes (VDS, home server), the slow part was not the backend or the rows: `host.profileRoutes()` refetches `/api/profiles` and makes Electron enumerate every saved connection (slowest one wins), and `requestForRoute` re-ran it before any read once its route cache was older than 5 s. The Timeline is usually opened later than that, so it paid the whole lookup before `session.list`, as did every 15 s refetch.
+- Reads now reuse the route catalog for `ROUTE_CATALOG_TTL_MS` (5 min). Navigator open, the Refresh button and every action still resolve the route fresh. A failed read re-checks its route once: if the route is gone the user gets the "no longer available" error; otherwise the original error stands. The call is never re-sent, so a write cannot run twice.
+- The Navigator prefetches the Timeline's session list (`prefetchTimeline`, same definition as the Timeline via `sessionListQuery`) when a profile is selected, so switching to Timeline shows rows at once. The prefetch is one fetch and adds no poll.
+- Measured backend cost on a real store: `session.list` 8-43 ms, `projects.tree` 17-112 ms, `profiles.list` 18-546 ms. The plugin-side harness (fake host, 400 ms roster stand-in) went from 461 ms to 61 ms for a Timeline click. Not yet timed in the live app.
+
 ## Registration surfaces
 - Left-rail pane (`navigator-pane`), full page route `/navigator`, sidebar nav item, and command-palette action *Sidebar Navigator: Open All Projects & Sessions*.
 
 ## Tests
-- Run from repo root: `node --loader ./tests/loader.mjs --test tests/*.test.mjs` (122 tests: 112 against stubbed Desktop objects, 10 against the real Hermes gateway).
+- Run from repo root: `node --loader ./tests/loader.mjs --test tests/*.test.mjs` (128 tests: 118 against stubbed Desktop objects, 10 against the real Hermes gateway).
 
 ## Catalog pin
 - Authoritative pin lives upstream in `NousResearch/hermes-agent/plugin-catalog/ha-sidebar-navigator.yaml`. `plugin-catalog/ha-sidebar-navigator.yaml` here is a local reference copy and may lag the upstream pin.

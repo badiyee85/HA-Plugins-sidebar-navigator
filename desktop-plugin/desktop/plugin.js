@@ -91,6 +91,9 @@ export {
   ProjectBrowser,
   closeNavigatorPage,
   fetchProjectList,
+  prefetchTimeline,
+  sessionListQuery,
+  ROUTE_CATALOG_TTL_MS,
   ROW_PAGE_SIZE,
   invalidateTagsCache,
   tagsMapFor,
@@ -154,6 +157,12 @@ const ID = 'ha-sidebar-navigator'
 const LEGACY_ACTIVE_CONNECTION = '__legacy_active__'
 const LEGACY_ROUTE_MODE = 'legacy'
 const ROUTE_CACHE_TTL_MS = 5000
+// How long reads reuse the route catalog. `host.profileRoutes()` is not cheap on a
+// remote Desktop: it refetches /api/profiles and has Electron enumerate every
+// registry source (the slowest source sets the time). Navigator open, Refresh and
+// every action re-resolve fresh; a read that fails re-checks its route once.
+const ROUTE_CATALOG_TTL_MS = 5 * 60 * 1000
+const ROUTE_UNAVAILABLE = 'route_unavailable'
 
 function text(value) {
   return String(value ?? '').trim()
@@ -356,7 +365,7 @@ async function currentRoutes(transportHost = host, fresh = false) {
       const routes = normalizeRoutes(raw)
       if (generation === routeCatalogGeneration && routeCatalogHost === transportHost) {
         routeCatalog = routes
-        routeCatalogExpiresAt = Date.now() + ROUTE_CACHE_TTL_MS
+        routeCatalogExpiresAt = Date.now() + ROUTE_CATALOG_TTL_MS
       }
       return routes
     })
@@ -377,14 +386,38 @@ async function routeForRequest(route, transportHost = host, fresh = false) {
   const routes = await currentRoutes(transportHost, fresh)
   if (routes) {
     const current = reconcileRoute(normalized, routes)
-    if (!current) throw new Error('The selected profile route is no longer available. Refresh Navigator.')
+    if (!current) {
+      const gone = new Error('The selected profile route is no longer available. Refresh Navigator.')
+      gone.code = ROUTE_UNAVAILABLE
+      throw gone
+    }
     return current
   }
   return normalized
 }
 
 async function requestForRoute(route, method, params = {}, transportHost = host, owner = undefined, options = {}) {
-  const normalized = await routeForRequest(route, transportHost, Boolean(options.fresh))
+  const fresh = Boolean(options.fresh)
+  const normalized = await routeForRequest(route, transportHost, fresh)
+  try {
+    return await dispatchForRoute(normalized, method, params, transportHost, owner)
+  } catch (error) {
+    // The catalog is reused for minutes, so a failure may mean the route itself
+    // went away. Re-check it once (which also refreshes the cache for the next
+    // call): a vanished route gets the clear "no longer available" error. The call
+    // is never re-sent, so a write cannot run twice.
+    if (!fresh && !isLegacyRoute(normalized)) {
+      try {
+        await routeForRequest(route, transportHost, true)
+      } catch (recheck) {
+        if (recheck?.code === ROUTE_UNAVAILABLE) throw recheck
+      }
+    }
+    throw error
+  }
+}
+
+function dispatchForRoute(normalized, method, params, transportHost, owner) {
   const currentOwner = owner || ownerFrom(transportHost)
 
   if (isLegacyRoute(normalized)) {
@@ -455,6 +488,26 @@ const PROJECT_LIST_PARAMS = { preview_limit: 1 }
 
 function fetchProjectList(route) {
   return requestForRoute(route, 'projects.tree', PROJECT_LIST_PARAMS)
+}
+
+// One definition for the Timeline's session list, shared by the Timeline and the
+// prefetch that warms it when the Navigator opens (same key, same fetch).
+function sessionListQuery(route) {
+  return {
+    queryKey: queryKey('sessions', route),
+    queryFn: () => requestForRoute(route, 'session.list', { limit: SESSIONS_LIMIT }),
+    enabled: Boolean(route),
+    refetchInterval: 15000,
+    staleTime: 5000
+  }
+}
+
+// Warm the Timeline in the background so switching to it shows rows at once.
+// A one-off fetch: it adds no poll while the user stays on Projects.
+function prefetchTimeline(route, client = queryClient) {
+  if (!route || typeof client?.prefetchQuery !== 'function') return
+  const { queryKey: key, queryFn, staleTime } = sessionListQuery(route)
+  void Promise.resolve(client.prefetchQuery({ queryKey: key, queryFn, staleTime })).catch(() => {})
 }
 
 const viewAtom = atom('projects')
@@ -2588,13 +2641,7 @@ function SessionBrowser({ route }) {
   const tagsMap = tagsMapFor(route)
   const selection = useValue(selectionAtom)
 
-  const listQuery = useQuery({
-    queryKey: queryKey('sessions', route),
-    queryFn: () => requestForRoute(route, 'session.list', { limit: SESSIONS_LIMIT }),
-    enabled: Boolean(route),
-    refetchInterval: 15000,
-    staleTime: 5000
-  })
+  const listQuery = useQuery(sessionListQuery(route))
 
   // Only the project list is needed here (Move menu), so skip the session previews
   // and keep it out of the Projects view's cache entry.
@@ -3053,6 +3100,12 @@ function NavigatorShell({ onClose } = {}) {
   const whereOpen = Boolean(whereState?.open)
   const selection = useValue(selectionAtom)
   const selectMode = Boolean(selection?.active)
+
+  // Warm the Timeline as soon as a profile is chosen, so the switch is instant.
+  const selectedRouteKey = routeKey(selectedRoute)
+  useEffect(() => {
+    prefetchTimeline(selectedRoute)
+  }, [selectedRouteKey])
 
   // Query projects for WhereDialog when route is selected
   const projectsQuery = useQuery({
