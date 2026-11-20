@@ -23,7 +23,7 @@ This project complies strictly with the curated Hermes Plugin Catalog standards 
    - **Phase 1 (Plugin Repo):** Complete code, tests, docs, `plugin.yaml`, and `desktop/plugin.js`. Commit and push to `origin/main`. Record the immutable commit SHA via `git rev-parse HEAD`.
    - **Phase 2 (Upstream Catalog PR):** In the upstream PR branch on `NousResearch/hermes-agent`, update `plugin-catalog/<id>.yaml` with that exact SHA and `subdir: desktop-plugin`. Validate with `python3 scripts/validate_plugin_catalog.py`, commit, and push.
 3. **Pre-Submission Verification:**
-   - Always run `/home/badi/.hermes/hermes-agent/venv/bin/hermes plugins validate <path-to-plugin-dir>` before submitting.
+   - Always run `hermes plugins validate <path-to-plugin-dir>` before submitting.
 4. **Zero Self-Updating Code:** The plugin loads as static uncompiled ESM. It never attempts self-updates or remote script fetching.
 5. **Exact Commit SHA Pinning:** Catalog releases strictly pin a 40-character lowercase commit SHA (`^[0-9a-f]{40}$`).
 6. **Public Repository with Tagged Releases:** Releases correspond to git tags on the public repository.

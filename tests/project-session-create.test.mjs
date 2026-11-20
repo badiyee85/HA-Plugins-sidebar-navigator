@@ -13,17 +13,17 @@ import {
 test('resolveProjectCwd returns null for home / null / isNoProject', () => {
   assert.equal(resolveProjectCwd(null), null)
   assert.equal(resolveProjectCwd({ isNoProject: true, label: 'Home' }), null)
-  assert.equal(resolveProjectCwd({ isNoProject: true, path: '/home/badi' }), null)
+  assert.equal(resolveProjectCwd({ isNoProject: true, path: '/home/user' }), null)
 })
 
 test('resolveProjectCwd returns project.path or repo path', () => {
   assert.equal(
-    resolveProjectCwd({ id: 'sillybunny-dev', path: '/home/badi/projects/sillybunny-dev' }),
-    '/home/badi/projects/sillybunny-dev'
+    resolveProjectCwd({ id: 'sillybunny-dev', path: '/home/user/projects/sillybunny-dev' }),
+    '/home/user/projects/sillybunny-dev'
   )
   assert.equal(
-    resolveProjectCwd({ id: 'repo-only', repos: [{ path: '/home/badi/projects/repo' }] }),
-    '/home/badi/projects/repo'
+    resolveProjectCwd({ id: 'repo-only', repos: [{ path: '/home/user/projects/repo' }] }),
+    '/home/user/projects/repo'
   )
 })
 
@@ -51,14 +51,14 @@ test('createSessionInProject creates project session and navigates in-place', as
   const project = {
     id: 'sillybunny-dev',
     label: 'SillyBunny Dev',
-    path: '/home/badi/projects/sillybunny-dev'
+    path: '/home/user/projects/sillybunny-dev'
   }
 
   const createdId = await createSessionInProject(project, route)
   assert.equal(createdId, 'stored_sillybunny_123')
   assert.equal(capturedMethod, 'session.create')
   assert.deepEqual(capturedParams, {
-    cwd: '/home/badi/projects/sillybunny-dev'
+    cwd: '/home/user/projects/sillybunny-dev'
   })
   assert.equal(host.lastOpenedSession?.sessionId, 'stored_sillybunny_123')
   assert.equal(host.lastOpenedSession?.options?.intent, 'in-place')
