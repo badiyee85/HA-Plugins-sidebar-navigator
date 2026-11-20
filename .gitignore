@@ -4,3 +4,8 @@ node_modules/
 .worktrees/
 scripts/
 
+
+# Python bytecode must never be committed (catalog rule 17)
+__pycache__/
+*.pyc
+*.pyo
